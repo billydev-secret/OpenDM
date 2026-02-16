@@ -6,6 +6,8 @@ from discord import app_commands
 from dotenv import load_dotenv
 import json
 
+from dm_logic import DM_ROLE_NAMES, ROLE_DM_ASK, ROLE_DM_CLOSED, ROLE_DM_OPEN, resolve_mode
+
 # ==============================
 # Configuration
 # ==============================
@@ -32,16 +34,6 @@ INTERACTION_PAIRS = {}        # {channel_id: set(("userA","userB"))}
 AUDIT_LOG_CHANNEL_ID = None
 AUDIT_FILE = "dm_audit_log.json"
 
-# Static DM Mode Roles
-ROLE_DM_OPEN = "DMs: Open"
-ROLE_DM_ASK = "DMs: Ask"
-ROLE_DM_CLOSED = "DMs: Closed"
-
-DM_ROLE_NAMES = {
-    ROLE_DM_OPEN,
-    ROLE_DM_ASK,
-    ROLE_DM_CLOSED
-}
 
 # ==============================
 # Bot Class
@@ -146,18 +138,6 @@ def save_request_channels():
     with open(REQUEST_CHANNEL_FILE, "w") as f:
         json.dump(REQUEST_CHANNELS, f, indent=4)
 
-
-def resolve_mode(member: discord.Member):
-
-    role_names = {role.name for role in member.roles}
-
-    if ROLE_DM_CLOSED in role_names:
-        return "closed"
-
-    if ROLE_DM_ASK in role_names:
-        return "ask"
-
-    return "open"
 
 def load_consent():
     global INTERACTION_PAIRS
@@ -1020,4 +1000,5 @@ async def dm_set_audit_channel(interaction: discord.Interaction, channel: discor
 # Run Bot
 # ==============================
 
-bot.run(TOKEN)
+if __name__ == "__main__":
+    bot.run(TOKEN)
