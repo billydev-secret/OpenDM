@@ -8,19 +8,16 @@ import json
 # ==============================
 # Configuration
 # ==============================
-
 load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
+GUILD_ID = os.getenv("DISCORD_TOKEN")
 
-GUILD_ID = 1469491362444480666
-SPOILER_REQUIRED_CHANNELS = {1469604360756396167}
 BYPASS_ROLE_IDS = set()
 CONSENT_FILE = "consent_data.json"
 
 DEBUG = True  # Set to False when going global
 REQUEST_CHANNELS = {}  # {guild_id: channel_id}
 REQUEST_CHANNEL_FILE = "request_channels.json"
-
 
 # ==============================
 # Intents
@@ -30,6 +27,9 @@ intents.members = True
 
 # Interaction Consent State
 INTERACTION_PAIRS = {}        # {channel_id: set(("userA","userB"))}
+
+AUDIT_LOG_CHANNEL_ID = None
+AUDIT_FILE = "dm_audit_log.json"
 
 # Static DM Mode Roles
 ROLE_DM_OPEN = "DMs: Open"
@@ -96,6 +96,42 @@ async def on_member_update(before: discord.Member, after: discord.Member):
 # ==============================
 # Logic
 # ==============================
+async def log_audit_event(guild: discord.Guild, message: str):
+    global AUDIT_LOG_CHANNEL_ID
+
+    timestamp = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+
+    log_entry = {
+        "timestamp": timestamp,
+        "guild_id": guild.id,
+        "message": message
+    }
+
+    # Append to JSON file
+    try:
+        with open(AUDIT_FILE, "r") as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        data = []
+
+    data.append(log_entry)
+
+    with open(AUDIT_FILE, "w") as f:
+        json.dump(data, f, indent=4)
+
+    # Send to audit channel if configured
+    if AUDIT_LOG_CHANNEL_ID:
+        channel = guild.get_channel(AUDIT_LOG_CHANNEL_ID)
+        if channel:
+            embed = discord.Embed(
+                title="📜 DM Permission Audit",
+                description=message,
+                color=discord.Color.blurple()
+            )
+            embed.set_footer(text=timestamp)
+            await channel.send(embed=embed)
+
+
 def load_request_channels():
     global REQUEST_CHANNELS
     try:
@@ -211,6 +247,11 @@ class AskConsentView(discord.ui.View):
             color=discord.Color.green()
         )
 
+        await log_audit_event(
+            interaction.guild,
+            f"DM request accepted: {interaction.user.display_name} ↔ requester"
+        )
+
         await interaction.response.edit_message(
             embed=success_embed,
             view=self
@@ -233,6 +274,11 @@ class AskConsentView(discord.ui.View):
             title="❌ Consent Denied",
             description="No permission was granted.",
             color=discord.Color.red()
+        )
+
+        await log_audit_event(
+            interaction.guild,
+            f"DM request denied by {interaction.user.display_name}"
         )
 
         await interaction.response.edit_message(
@@ -535,6 +581,11 @@ async def dm_revoke(interaction: discord.Interaction, user: discord.Member):
         pair_set.remove((user.id, interaction.user.id))
         removed = True
 
+    await log_audit_event(
+        interaction.guild,
+        f"DM permission removed: {interaction.user.id} ↔ {user.display_name} (by {interaction.user.display_name})"
+    )
+
     if removed:
         save_consent()
         await interaction.response.send_message(
@@ -704,6 +755,12 @@ async def dm_ask(interaction: discord.Interaction, user: discord.Member):
         )
         return
 
+    await log_audit_event(
+        interaction.guild,
+        f"DM request initiated: {interaction.user.display_name} ➝ {user.display_name}"
+    )
+
+
     await interaction.response.send_message(
         f"📨 DM request sent to {request_channel.mention}.",
         ephemeral=True
@@ -856,6 +913,11 @@ async def debug_permissions_set(
 
     save_consent()
 
+    await log_audit_event(
+        interaction.guild,
+        f"Manual DM permission set: {user1.display_name} ↔ {user2.display_name} (by {interaction.user.display_name})"
+    )
+
     await interaction.response.send_message(
         f"✅ DM permission permission established between "
         f"{user1.mention} and {user2.mention}."
@@ -923,7 +985,33 @@ async def debug_permissions_remove(
             "No mutual permission existed between those users.",
             ephemeral=True
         )
+    
+    await log_audit_event(
+        interaction.guild,
+        f"DM permission removed: {user1.display_name} ↔ {user2.display_name} (by {interaction.user.display_name})"
+    )
 
+@bot.tree.command(
+    name="dm_set_audit_channel",
+    description="Set channel for DM permission audit logs",
+    guild=discord.Object(id=GUILD_ID) if DEBUG else None
+)
+@app_commands.describe(channel="Channel to send audit logs to")
+async def dm_set_audit_channel(interaction: discord.Interaction, channel: discord.TextChannel):
+
+    if not interaction.user.guild_permissions.manage_guild:
+        await interaction.response.send_message(
+            "You do not have permission to configure audit logging.",
+            ephemeral=True
+        )
+        return
+
+    global AUDIT_LOG_CHANNEL_ID
+    AUDIT_LOG_CHANNEL_ID = channel.id
+
+    await interaction.response.send_message(
+        f"📜 Audit logs will now be sent to {channel.mention}."
+    )
 
 
 
