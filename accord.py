@@ -27,7 +27,6 @@ REQUEST_CHANNEL_FILE = "request_channels.json"
 # ==============================
 intents = discord.Intents.default()
 intents.members = True
-intents.message_content = True  # Required for spoiler enforcement
 
 # Interaction Consent State
 INTERACTION_PAIRS = {}        # {channel_id: set(("userA","userB"))}
@@ -93,79 +92,24 @@ async def on_member_update(before: discord.Member, after: discord.Member):
         except discord.Forbidden:
             pass
 
-@bot.event
-async def on_message(message: discord.Message):
-
-    if DEBUG:
-        print("Message detected:", message.content, message.attachments)
-
-    if message.author.bot:
-        return
-
-    # ==============================
-    # Spoiler Enforcement
-    # ==============================
-    if message.channel.id in SPOILER_REQUIRED_CHANNELS:
-
-        if any(role.id in BYPASS_ROLE_IDS for role in message.author.roles):
-            pass
-
-        elif message.attachments:
-            for attachment in message.attachments:
-                filename = attachment.filename.lower()
-
-                if filename.endswith((".png", ".jpg", ".jpeg")):
-                    if not attachment.is_spoiler():
-                        try:
-                            await message.delete()
-                            await message.channel.send(
-                                f"{message.author.mention} — 🚨 NSFW images must be marked as spoiler.",
-                                delete_after=20
-                            )
-                        except discord.Forbidden:
-                            pass
-                        return
-
-    # ==============================
-    # Mutual Mention Enforcement
-    # ==============================
-    # if not message.mentions:
-    #     return
-
-    # guild_id = message.guild.id
-    # pair_set = INTERACTION_PAIRS.get(guild_id, set())
-
-    # for mentioned_user in message.mentions:
-
-    #     if mentioned_user.bot:
-    #         continue
-
-    #     mode = resolve_mode(mentioned_user)
-
-    #     if mode == "open":
-    #         continue
-
-    #     if mode == "closed":
-    #         await message.delete()
-    #         await message.channel.send(
-    #             f"{message.author.mention} — {mentioned_user.display_name} does not allow mentions.",
-    #             delete_after=10
-    #         )
-    #         return
-
-    #     if mode == "ask":
-    #         if (message.author.id, mentioned_user.id) not in pair_set:
-    #             await message.delete()
-    #             await message.channel.send(
-    #                 f"{message.author.mention} — DM request required before mentioning {mentioned_user.display_name}.",
-    #                 delete_after=10
-    #             )
-    #             return
-
 
 # ==============================
 # Logic
 # ==============================
+def load_request_channels():
+    global REQUEST_CHANNELS
+    try:
+        with open(REQUEST_CHANNEL_FILE, "r") as f:
+            raw = json.load(f)
+            REQUEST_CHANNELS = {int(k): v for k, v in raw.items()}
+    except FileNotFoundError:
+        REQUEST_CHANNELS = {}
+
+def save_request_channels():
+    with open(REQUEST_CHANNEL_FILE, "w") as f:
+        json.dump(REQUEST_CHANNELS, f, indent=4)
+
+
 def resolve_mode(member: discord.Member):
 
     role_names = {role.name for role in member.roles}
@@ -193,20 +137,6 @@ def load_consent():
                     INTERACTION_PAIRS[int(guild_id)].add((b, a))
     except FileNotFoundError:
         INTERACTION_PAIRS = {}
-
-def load_request_channels():
-    global REQUEST_CHANNELS
-    try:
-        with open(REQUEST_CHANNEL_FILE, "r") as f:
-            raw = json.load(f)
-            REQUEST_CHANNELS = {int(k): int(v) for k, v in raw.items()}
-    except FileNotFoundError:
-        REQUEST_CHANNELS = {}
-
-
-def save_request_channels():
-    with open(REQUEST_CHANNEL_FILE, "w") as f:
-        json.dump(REQUEST_CHANNELS, f, indent=4)
 
 
 def save_consent():
@@ -236,6 +166,10 @@ class AskConsentView(discord.ui.View):
     async def on_timeout(self):
         for child in self.children:
             child.disabled = True
+        try:
+            await self.message.edit(view=self)
+        except:
+            pass
 
     @discord.ui.button(label="Accept", style=discord.ButtonStyle.success)
     async def accept(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -257,19 +191,20 @@ class AskConsentView(discord.ui.View):
 
         save_consent()
 
-        for child in self.children:
-            child.disabled = True
+        requester = interaction.guild.get_member(self.requester_id)
+        target = interaction.guild.get_member(self.target_id)
 
-        success_embed = discord.Embed(
+        embed = discord.Embed(
             title="✅ DM Request Approved",
-            description="Both users may now mention each other.",
+            description=f"{requester.mention} and {target.mention} may now DM request each other.",
             color=discord.Color.green()
         )
 
         await interaction.response.edit_message(
-            embed=success_embed,
-            view=self
+            embed=embed,
+            view=None
         )
+
 
 
     @discord.ui.button(label="Deny", style=discord.ButtonStyle.danger)
@@ -300,22 +235,6 @@ class AskConsentView(discord.ui.View):
 # ==============================
 # Slash Commands
 # ==============================
-# @bot.tree.command(
-#     name="consent_check_enable",
-#     description="Enable mutual mention consent in a channel",
-#     guild=discord.Object(id=GUILD_ID) if DEBUG else None
-# )
-# @app_commands.describe(channel="Channel to enforce mention consent in")
-# async def consent_check_enable(interaction: discord.Interaction, channel: discord.TextChannel):
-
-#     if not interaction.user.guild_permissions.manage_channels:
-#         await interaction.response.send_message("No permission.", ephemeral=True)
-#         return
-
-#     await interaction.response.send_message(
-#         f"Mutual mention consent enabled in {channel.mention}"
-#     )
-
 @bot.tree.command(
     name="dm_help",
     description="Learn how DM request permissions work",
@@ -478,7 +397,7 @@ async def dm_info(interaction: discord.Interaction):
         )
 
     embed.set_footer(
-        text="Use /dm_ask, /dm_permissions_set, or /dm_revoke to manage permissions."
+        text="Use /dm_ask or /dm_revoke to manage permissions."
     )
 
     await interaction.response.send_message(embed=embed, ephemeral=True)
@@ -524,7 +443,7 @@ async def dm_set_mode(interaction: discord.Interaction, mode: app_commands.Choic
         return
 
     # Remove ALL DM roles first
-    dm_roles = [r for r in guild.roles if r.name in DM_ROLE_NAMES]
+    dm_roles = [r for r in member.roles if r.name in DM_ROLE_NAMES]
 
     try:
         await member.remove_roles(*dm_roles)
@@ -580,7 +499,7 @@ async def dm_allow(interaction: discord.Interaction, user: discord.Member):
 
 @bot.tree.command(
     name="dm_revoke",
-    description="Revoke mutual mention consent with another user",
+    description="Revoke DM consent with another user",
     guild=discord.Object(id=GUILD_ID) if DEBUG else None
 )
 @app_commands.describe(user="User to revoke consent with")
@@ -610,7 +529,7 @@ async def dm_revoke(interaction: discord.Interaction, user: discord.Member):
     if removed:
         save_consent()
         await interaction.response.send_message(
-            f"Mutual mention consent revoked with {user.mention}."
+            f"DM consent revoked with {user.mention}."
         )
     else:
         await interaction.response.send_message(
@@ -621,7 +540,7 @@ async def dm_revoke(interaction: discord.Interaction, user: discord.Member):
 
 @bot.tree.command(
     name="dm_status",
-    description="Check mutual mention consent status with a user",
+    description="Check DM consent status with a user",
     guild=discord.Object(id=GUILD_ID) if DEBUG else None
 )
 @app_commands.describe(user="User to check status with")
@@ -644,7 +563,7 @@ async def dm_status(interaction: discord.Interaction, user: discord.Member):
         result = "❌ No mutual consent."
 
     await interaction.response.send_message(
-        f"**Mutual Mention Status**\n\n"
+        f"**DM permission Status**\n\n"
         f"You ↔ {user.display_name}\n\n"
         f"{result}",
         ephemeral=True
@@ -657,11 +576,12 @@ async def dm_status(interaction: discord.Interaction, user: discord.Member):
 )
 @app_commands.describe(user="User to request permission from")
 async def dm_ask(interaction: discord.Interaction, user: discord.Member):
-
-    guild_id = interaction.guild.id  # ✅ DEFINE FIRST
+    guild = interaction.guild
+    guild_id = guild.id
+    requester = interaction.user
 
     # ❌ Self check
-    if user.id == interaction.user.id:
+    if user.id == requester.id and not DEBUG:
         await interaction.response.send_message(
             "You cannot request permission with yourself.",
             ephemeral=True
@@ -687,7 +607,7 @@ async def dm_ask(interaction: discord.Interaction, user: discord.Member):
         return
 
     # ✅ OPEN shortcut
-    if mode == "open":
+    if mode == "open" and not DEBUG:
         await interaction.response.send_message(
             f"{user.display_name} has DMs set to OPEN. No request required.",
             ephemeral=True
@@ -697,14 +617,84 @@ async def dm_ask(interaction: discord.Interaction, user: discord.Member):
     # ❌ Existing relationship
     pair_set = INTERACTION_PAIRS.get(guild_id, set())
 
-    if (interaction.user.id, user.id) in pair_set:
+    if (requester.id, user.id) in pair_set:
         await interaction.response.send_message(
             "A permission relationship already exists.",
             ephemeral=True
         )
         return
 
-    # ---- SEND EMBED REQUEST BELOW ----
+    # -------------------------------
+    # Determine Request Channel
+    # -------------------------------
+    request_channel_id = REQUEST_CHANNELS.get(guild_id)
+
+    if not request_channel_id:
+        await interaction.response.send_message(
+            "No DM request channel has been configured. Use `/dm_request_channel_set` first.",
+            ephemeral=True
+        )
+        return
+
+    request_channel = guild.get_channel(request_channel_id)
+
+    if not request_channel:
+        await interaction.response.send_message(
+            "Configured DM request channel is invalid.",
+            ephemeral=True
+        )
+        return
+
+    # -------------------------------
+    # Create Embed
+    # -------------------------------
+    embed = discord.Embed(
+        title="📨 DM Request",
+        description=(
+            f"{user.mention}\n\n"
+            f"**{interaction.user.display_name}** would like permission to DM you!\n\n"
+        ),
+        color=discord.Color.gold()
+    )
+
+    # Small avatar in top bar only
+    embed.set_author(
+        name=interaction.user.display_name,
+        icon_url=interaction.user.display_avatar.url
+    )
+
+    embed.set_footer(text="Permissuion can be revoked at any time with with /dm_revoke")
+
+
+
+    # -------------------------------
+    # Create View
+    # -------------------------------
+    view = AskConsentView(
+        requester_id=requester.id,
+        target_id=user.id
+    )
+
+    # -------------------------------
+    # Send to Request Channel
+    # -------------------------------
+    try:
+        await request_channel.send(
+            embed=embed,
+            view=view
+        )
+    except discord.Forbidden:
+        await interaction.response.send_message(
+            "I do not have permission to send messages in the configured DM request channel.",
+            ephemeral=True
+        )
+        return
+
+    await interaction.response.send_message(
+        f"📨 DM request sent to {request_channel.mention}.",
+        ephemeral=True
+    )
+
 
 
 @bot.tree.command(
@@ -767,7 +757,7 @@ async def debug_status_check(interaction: discord.Interaction):
 
 @bot.tree.command(
     name="debug_permissions_list",
-    description="List all stored mutual mention permissions",
+    description="List all stored DM permission permissions",
     guild=discord.Object(id=GUILD_ID) if DEBUG else None
 )
 async def debug_permissions_list(interaction: discord.Interaction):
@@ -779,7 +769,7 @@ async def debug_permissions_list(interaction: discord.Interaction):
 
     if not pairs:
         await interaction.response.send_message(
-            "No stored mutual mention permissions exist.",
+            "No stored DM permission permissions exist.",
             ephemeral=True
         )
         return
@@ -807,13 +797,13 @@ async def debug_permissions_list(interaction: discord.Interaction):
         output = output[:1800] + "\n... (truncated)"
 
     await interaction.response.send_message(
-        f"**Stored Mutual Mention Permissions**\n\n{output}",
+        f"**Stored DM permission Permissions**\n\n{output}",
         ephemeral=True
     )
 
 @bot.tree.command(
     name="debug_permissions_set",
-    description="Manually set mutual mention permission between two users",
+    description="Manually set DM permission permission between two users",
     guild=discord.Object(id=GUILD_ID) if DEBUG else None
 )
 @app_commands.describe(
@@ -853,13 +843,13 @@ async def debug_permissions_set(
     save_consent()
 
     await interaction.response.send_message(
-        f"✅ Mutual mention permission established between "
+        f"✅ DM permission permission established between "
         f"{user1.mention} and {user2.mention}."
     )
 
 @bot.tree.command(
     name="debug_permissions_remove",
-    description="Remove mutual mention permission between two users",
+    description="Remove DM permission permission between two users",
     guild=discord.Object(id=GUILD_ID) if DEBUG else None
 )
 @app_commands.describe(
@@ -911,7 +901,7 @@ async def debug_permissions_remove(
     if removed:
         save_consent()
         await interaction.response.send_message(
-            f"🗑️ Mutual mention permission removed between "
+            f"🗑️ DM permission permission removed between "
             f"{user1.mention} and {user2.mention}."
         )
     else:
@@ -921,118 +911,6 @@ async def debug_permissions_remove(
         )
 
 
-@bot.tree.command(
-    name="spoiler_add_channel",
-    description="Require spoilers for images in a channel",
-    guild=discord.Object(id=GUILD_ID) if DEBUG else None
-)
-@app_commands.describe(channel="Channel to enforce spoiler images in")
-async def spoiler_add_channel(
-    interaction: discord.Interaction,
-    channel: discord.TextChannel
-):
-    if not interaction.user.guild_permissions.manage_channels:
-        await interaction.response.send_message(
-            "You do not have permission to configure this.",
-            ephemeral=True
-        )
-        return
-
-    SPOILER_REQUIRED_CHANNELS.add(channel.id)
-
-    await interaction.response.send_message(
-        f"Spoiler enforcement enabled in {channel.mention}"
-    )
-
-
-@bot.tree.command(
-    name="spoiler_remove_channel",
-    description="Stop requiring spoilers in a channel",
-    guild=discord.Object(id=GUILD_ID) if DEBUG else None
-)
-@app_commands.describe(channel="Channel to remove enforcement from")
-async def spoiler_remove_channel(
-    interaction: discord.Interaction,
-    channel: discord.TextChannel
-):
-    if not interaction.user.guild_permissions.manage_channels:
-        await interaction.response.send_message(
-            "You do not have permission to configure this.",
-            ephemeral=True
-        )
-        return
-
-    SPOILER_REQUIRED_CHANNELS.discard(channel.id)
-
-    await interaction.response.send_message(
-        f"Spoiler enforcement disabled in {channel.mention}"
-    )
-
-@bot.tree.command(
-    name="lurker_locator",
-    description="Report inactivity for a role",
-    guild=discord.Object(id=GUILD_ID) if DEBUG else None
-)
-@app_commands.describe(
-    role="Role to analyze",
-    days="Number of days to check (default: 7)"
-)
-async def lurker_locator(
-    interaction: discord.Interaction,
-    role: discord.Role,
-    days: app_commands.Range[int, 1, 60] = 7
-):
-    if not interaction.user.guild_permissions.manage_roles:
-        await interaction.response.send_message(
-            "You do not have permission to use this command.",
-            ephemeral=True
-        )
-        return
-
-    await interaction.response.defer()
-
-    guild = interaction.guild
-    cutoff = discord.utils.utcnow() - datetime.timedelta(days=days)
-
-    role_members = set(role.members)
-    active_members = set()
-
-    for channel in guild.text_channels:
-        if not channel.permissions_for(guild.me).read_message_history:
-            continue
-
-        try:
-            async for message in channel.history(after=cutoff, limit=None):
-                if message.author in role_members:
-                    active_members.add(message.author)
-
-                if active_members == role_members:
-                    break
-        except discord.Forbidden:
-            continue
-
-    inactive_members = role_members - active_members
-
-    total = len(role_members)
-    inactive_count = len(inactive_members)
-    inactive_percent = (inactive_count / total * 100) if total else 0
-
-    summary = (
-        f"**Role Activity Report — {role.name} ({days} days)**\n"
-        f"Total Members: {total}\n"
-        f"Inactive: {inactive_count} ({inactive_percent:.1f}%)\n"
-        f"----------------------------------\n"
-    )
-
-    if inactive_members:
-        member_list = "\n".join(m.display_name for m in inactive_members)
-        if len(member_list) > 1800:
-            member_list = member_list[:1800] + "\n... (truncated)"
-        summary += "\n**Inactive Members:**\n" + member_list
-    else:
-        summary += "\nAll members active in this period."
-
-    await interaction.followup.send(summary)
 
 
 # ==============================
