@@ -159,16 +159,27 @@ def save_consent():
 
 class AskConsentView(discord.ui.View):
     def __init__(self, requester_id: int, target_id: int):
-        super().__init__(timeout=120)
+        super().__init__(timeout=86400)  # 24 hours
         self.requester_id = requester_id
         self.target_id = target_id
+        self.message = None  # Will be set after send
 
     async def on_timeout(self):
         for child in self.children:
             child.disabled = True
+
+        timeout_embed = discord.Embed(
+            title="⌛ DM Request Expired",
+            description="This DM request expired after 24 hours.",
+            color=discord.Color.orange()
+        )
+
         try:
-            await self.message.edit(view=self)
-        except:
+            if self.message:
+                await self.message.edit(embed=timeout_embed, view=self)
+        except discord.NotFound:
+            pass
+        except discord.Forbidden:
             pass
 
     @discord.ui.button(label="Accept", style=discord.ButtonStyle.success)
@@ -191,21 +202,19 @@ class AskConsentView(discord.ui.View):
 
         save_consent()
 
-        requester = interaction.guild.get_member(self.requester_id)
-        target = interaction.guild.get_member(self.target_id)
+        for child in self.children:
+            child.disabled = True
 
-        embed = discord.Embed(
-            title="✅ DM Request Approved",
-            description=f"{requester.mention} and {target.mention} may now DM request each other.",
+        success_embed = discord.Embed(
+            title="✅ DM Permission Granted",
+            description="Both users may now DM each other.",
             color=discord.Color.green()
         )
 
         await interaction.response.edit_message(
-            embed=embed,
-            view=None
+            embed=success_embed,
+            view=self
         )
-
-
 
     @discord.ui.button(label="Deny", style=discord.ButtonStyle.danger)
     async def deny(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -653,6 +662,7 @@ async def dm_ask(interaction: discord.Interaction, user: discord.Member):
         description=(
             f"{user.mention}\n\n"
             f"**{interaction.user.display_name}** would like permission to DM you!\n\n"
+            f"This request will time out in 24 hours"
         ),
         color=discord.Color.gold()
     )
@@ -663,7 +673,7 @@ async def dm_ask(interaction: discord.Interaction, user: discord.Member):
         icon_url=interaction.user.display_avatar.url
     )
 
-    embed.set_footer(text="Permissuion can be revoked at any time with with /dm_revoke")
+    embed.set_footer(text="Permission can be revoked at any time with /dm_revoke")
 
 
 
@@ -679,10 +689,14 @@ async def dm_ask(interaction: discord.Interaction, user: discord.Member):
     # Send to Request Channel
     # -------------------------------
     try:
-        await request_channel.send(
+        message = await request_channel.send(
+            content=user.mention,
             embed=embed,
             view=view
         )
+
+        view.message = message
+
     except discord.Forbidden:
         await interaction.response.send_message(
             "I do not have permission to send messages in the configured DM request channel.",
