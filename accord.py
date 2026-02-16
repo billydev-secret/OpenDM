@@ -1,6 +1,7 @@
 import os
 import datetime
 import discord
+
 from discord import app_commands
 from dotenv import load_dotenv
 import json
@@ -10,7 +11,7 @@ import json
 # ==============================
 load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
-GUILD_ID = os.getenv("DISCORD_TOKEN")
+GUILD_ID = os.getenv("GUILD_ID")
 
 BYPASS_ROLE_IDS = set()
 CONSENT_FILE = "consent_data.json"
