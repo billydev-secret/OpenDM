@@ -202,24 +202,36 @@ async def update_consent_embed_revoked(
     user_one: discord.Member,
     user_two: discord.Member,
     revoked_by: discord.Member
-):
+) -> bool:
     guild_messages = CONSENT_MESSAGES.get(guild.id)
     if not guild_messages:
-        return
+        return False
 
     key = _pair_key(user_one.id, user_two.id)
     message_ref = guild_messages.get(key)
     if not message_ref:
-        return
+        return False
 
-    channel = guild.get_channel(message_ref["channel_id"])
+    channel_id = message_ref["channel_id"]
+    bot_get_channel = getattr(bot, "get_channel", None)
+    channel = guild.get_channel(channel_id)
+    if not channel and callable(bot_get_channel):
+        channel = bot_get_channel(channel_id)
+
     if not channel:
-        return
+        bot_fetch_channel = getattr(bot, "fetch_channel", None)
+        if callable(bot_fetch_channel):
+            try:
+                channel = await bot_fetch_channel(channel_id)
+            except (discord.NotFound, discord.Forbidden, AttributeError):
+                return False
+        else:
+            return False
 
     try:
         message = await channel.fetch_message(message_ref["message_id"])
     except (discord.NotFound, discord.Forbidden, AttributeError):
-        return
+        return False
 
     revoked_embed = discord.Embed(
         title="🚫 DM Permission Revoked",
@@ -231,14 +243,19 @@ async def update_consent_embed_revoked(
     )
 
     try:
-        await message.edit(embed=revoked_embed, view=None)
+        await message.edit(
+            content=f"🔁 Consent update: {user_one.mention} ↔ {user_two.mention}",
+            embed=revoked_embed,
+            view=None
+        )
     except (discord.NotFound, discord.Forbidden):
-        return
+        return False
 
     del guild_messages[key]
     if not guild_messages:
         del CONSENT_MESSAGES[guild.id]
     save_consent_messages()
+    return True
 
 
 class AskConsentView(discord.ui.View):
@@ -320,6 +337,7 @@ class AskConsentView(discord.ui.View):
         )
 
         await interaction.response.edit_message(
+            content=f"✅ Consent confirmed: {requester_mention} ↔ {target_mention}",
             embed=success_embed,
             view=self
         )
@@ -655,9 +673,10 @@ async def dm_revoke(interaction: discord.Interaction, user: discord.Member):
 
     if removed:
         save_consent()
-        await update_consent_embed_revoked(interaction.guild, interaction.user, user, interaction.user)
+        embed_updated = await update_consent_embed_revoked(interaction.guild, interaction.user, user, interaction.user)
+        suffix = " Updated the original request message." if embed_updated else " Could not update the original request message."
         await interaction.response.send_message(
-            f"DM consent revoked with {user.mention}."
+            f"DM consent revoked with {user.mention}.{suffix}"
         )
     else:
         await interaction.response.send_message(
