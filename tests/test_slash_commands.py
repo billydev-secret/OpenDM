@@ -258,3 +258,52 @@ def test_dm_set_audit_channel_requires_manage_guild_permission(accord_module):
     kwargs = interaction.response.send_message.await_args.kwargs
     assert get_sent_text(interaction.response.send_message) == "You do not have permission to configure audit logging."
     assert kwargs["ephemeral"] is True
+
+
+def test_accept_embed_lists_both_consented_users(accord_module, monkeypatch):
+    monkeypatch.setattr(accord_module, "save_consent", lambda: None)
+    monkeypatch.setattr(accord_module, "save_consent_messages", lambda: None)
+
+    requester = make_member(member_id=10, display_name="Requester")
+    target = make_member(member_id=20, display_name="Target")
+    guild = make_guild(guild_id=333, members={10: requester, 20: target})
+    interaction = make_interaction(guild, target)
+
+    view = accord_module.AskConsentView(requester_id=10, target_id=20)
+    view.message = SimpleNamespace(id=999, channel=SimpleNamespace(id=321))
+
+    run(view.accept(interaction, None))
+
+    embed = interaction.response.edit_message.await_args.kwargs["embed"]
+    assert "Requester: <@10>" in embed.description
+    assert "Target: <@20>" in embed.description
+
+
+def test_dm_revoke_updates_existing_grant_embed(accord_module, monkeypatch):
+    monkeypatch.setattr(accord_module, "save_consent", lambda: None)
+
+    requester = make_member(member_id=10, display_name="Requester")
+    target = make_member(member_id=20, display_name="Target")
+
+    message = SimpleNamespace(edit=AsyncMock())
+    channel = SimpleNamespace(fetch_message=AsyncMock(return_value=message))
+    guild = make_guild(guild_id=555, channels={77: channel})
+    interaction = make_interaction(guild, requester)
+
+    accord_module.INTERACTION_PAIRS = {555: {(10, 20), (20, 10)}}
+    accord_module.CONSENT_MESSAGES = {
+        555: {
+            "10:20": {
+                "channel_id": 77,
+                "message_id": 88,
+                "requester_id": 10,
+                "target_id": 20,
+            }
+        }
+    }
+
+    run(accord_module.dm_revoke(interaction, target))
+
+    message.edit.assert_awaited_once()
+    revoked_embed = message.edit.await_args.kwargs["embed"]
+    assert revoked_embed.title == "🚫 DM Permission Revoked"
