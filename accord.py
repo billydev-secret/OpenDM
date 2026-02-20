@@ -7,6 +7,7 @@ from dotenv import load_dotenv
 import json
 
 from dm_logic import DM_ROLE_NAMES, ROLE_DM_ASK, ROLE_DM_CLOSED, ROLE_DM_OPEN, resolve_mode
+import logging
 
 # ==============================
 # Configuration
@@ -17,11 +18,14 @@ GUILD_ID = os.getenv("GUILD_ID")
 
 BYPASS_ROLE_IDS = set()
 CONSENT_FILE = "consent_data.json"
-CONSENT_MESSAGE_FILE = "consent_messages.json"
+DM_REQUESTS_FILE = "dm_requests.json"
 
 DEBUG = True  # Set to False when going global
 REQUEST_CHANNELS = {}  # {guild_id: channel_id}
 REQUEST_CHANNEL_FILE = "request_channels.json"
+
+log = logging.getLogger("accord")  # your bot namespace
+
 
 # ==============================
 # Intents
@@ -31,7 +35,7 @@ intents.members = True
 
 # Interaction Consent State
 INTERACTION_PAIRS = {}        # {channel_id: set(("userA","userB"))}
-CONSENT_MESSAGES = {}         # {guild_id: {"min:max": {channel_id, message_id, requester_id, target_id}}}
+DM_REQUESTS = {}  # {guild_id: {(user1_id, user2_id): message_id}}
 
 AUDIT_LOG_CHANNEL_ID = None
 AUDIT_FILE = "dm_audit_log.json"
@@ -51,10 +55,10 @@ class Bot(discord.Client):
             if not hasattr(self, "synced"):
                 await self.tree.sync(guild=guild)
                 self.synced = True
-            print("Synced commands to development guild.")
+            log.info("Synced commands to development guild.")
         else:
             await self.tree.sync()
-            print("Synced commands globally.")
+            log.info("Synced commands globally.")
 
 bot = Bot()
 
@@ -63,11 +67,9 @@ bot = Bot()
 # ==============================
 @bot.event
 async def on_ready():
-    print(f"Logged in as {bot.user} (ID: {bot.user.id})")
+    log.info(f"Logged in as {bot.user} (ID: {bot.user.id})")
     load_consent()
-    load_consent_messages()
     load_request_channels()
-    print("------")
 
 @bot.event
 async def on_member_update(before: discord.Member, after: discord.Member):
@@ -88,10 +90,69 @@ async def on_member_update(before: discord.Member, after: discord.Member):
         except discord.Forbidden:
             pass
 
+@bot.event
+async def on_disconnect():
+    save_consent()
 
 # ==============================
 # Logic
 # ==============================
+async def safe_dm_user(user: discord.User | discord.Member, embed: discord.Embed):
+    try:
+        await user.send(embed=embed)
+    except discord.Forbidden:
+        # User has DMs closed or blocked the bot
+        pass
+    except discord.HTTPException:
+        pass
+
+
+def load_audit_log():
+    try:
+        with open(AUDIT_FILE, "r") as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return []
+
+
+def is_mutual(guild_id: int, user1: int, user2: int) -> bool:
+    pairs = INTERACTION_PAIRS.get(guild_id, set())
+    return (
+        (user1, user2) in pairs and
+        (user2, user1) in pairs
+    )
+
+def add_mutual_pair(pair_set: set, a: int, b: int):
+    pair_set.add((a, b))
+    pair_set.add((b, a))
+
+def load_dm_requests():
+    global DM_REQUESTS
+    try:
+        with open(DM_REQUESTS_FILE, "r") as f:
+            raw = json.load(f)
+            DM_REQUESTS = {
+                int(g): {
+                    tuple(map(int, k.split("-"))): v
+                    for k, v in pairs.items()
+                }
+                for g, pairs in raw.items()
+            }
+    except FileNotFoundError:
+        DM_REQUESTS = {}
+
+def save_dm_requests():
+    output = {}
+    for guild_id, pairs in DM_REQUESTS.items():
+        output[str(guild_id)] = {
+            f"{a}-{b}": msg_id
+            for (a, b), msg_id in pairs.items()
+        }
+
+    with open(DM_REQUESTS_FILE, "w") as f:
+        json.dump(output, f, indent=4)
+
+
 async def log_audit_event(guild: discord.Guild, message: str):
     global AUDIT_LOG_CHANNEL_ID
 
@@ -114,6 +175,8 @@ async def log_audit_event(guild: discord.Guild, message: str):
 
     with open(AUDIT_FILE, "w") as f:
         json.dump(data, f, indent=4)
+
+    log.info(log_entry)
 
     # Send to audit channel if configured
     if AUDIT_LOG_CHANNEL_ID:
@@ -144,40 +207,28 @@ def save_request_channels():
 
 def load_consent():
     global INTERACTION_PAIRS
+    INTERACTION_PAIRS = {}
+
     try:
         with open(CONSENT_FILE, "r") as f:
             raw = json.load(f)
 
-        for guild_id, pairs in raw.items():
-            INTERACTION_PAIRS[int(guild_id)] = set()
-            for pair in pairs:
-                a, b = pair
-                if a != b:
-                    INTERACTION_PAIRS[int(guild_id)].add((a, b))
-                    INTERACTION_PAIRS[int(guild_id)].add((b, a))
+        for guild_id_str, pairs in raw.items():
+            guild_id = int(guild_id_str)
+            INTERACTION_PAIRS[guild_id] = set()
+
+            for a, b in pairs:
+                if a == b:
+                    continue
+                INTERACTION_PAIRS[guild_id].add((a, b))
+                INTERACTION_PAIRS[guild_id].add((b, a))
+
     except FileNotFoundError:
         INTERACTION_PAIRS = {}
 
-
-def _pair_key(user_a_id: int, user_b_id: int) -> str:
-    low, high = sorted((user_a_id, user_b_id))
-    return f"{low}:{high}"
-
-
-def load_consent_messages():
-    global CONSENT_MESSAGES
-    try:
-        with open(CONSENT_MESSAGE_FILE, "r") as f:
-            raw = json.load(f)
-
-        CONSENT_MESSAGES = {int(guild_id): messages for guild_id, messages in raw.items()}
-    except FileNotFoundError:
-        CONSENT_MESSAGES = {}
-
-
-def save_consent_messages():
-    with open(CONSENT_MESSAGE_FILE, "w") as f:
-        json.dump(CONSENT_MESSAGES, f, indent=4)
+    if DEBUG:
+        log.info("=== CONSENT STATE AFTER LOAD ===")
+        log.info("Loaded pairs:", INTERACTION_PAIRS)
 
 
 def save_consent():
@@ -198,91 +249,28 @@ def save_consent():
         json.dump(output, f, indent=4)
 
 
-async def update_consent_embed_revoked(
-    guild: discord.Guild,
-    user_one: discord.Member,
-    user_two: discord.Member,
-    revoked_by: discord.Member
-) -> bool:
-    guild_messages = CONSENT_MESSAGES.get(guild.id)
-    if not guild_messages:
-        return False
-
-    key = _pair_key(user_one.id, user_two.id)
-    message_ref = guild_messages.get(key)
-    if not message_ref:
-        return False
-
-    channel_id = message_ref["channel_id"]
-    bot_get_channel = getattr(bot, "get_channel", None)
-    channel = guild.get_channel(channel_id)
-    if not channel and callable(bot_get_channel):
-        channel = bot_get_channel(channel_id)
-
-    if not channel:
-        bot_fetch_channel = getattr(bot, "fetch_channel", None)
-        if callable(bot_fetch_channel):
-            try:
-                channel = await bot_fetch_channel(channel_id)
-            except (discord.NotFound, discord.Forbidden, AttributeError):
-                return False
-        else:
-            return False
-
-    try:
-        message = await channel.fetch_message(message_ref["message_id"])
-    except (discord.NotFound, discord.Forbidden, AttributeError):
-        return False
-
-    revoked_embed = discord.Embed(
-        title="🚫 DM Permission Revoked",
-        description=(
-            f"DM permission between {user_one.mention} and {user_two.mention} has been revoked.\n\n"
-            f"Revoked by: **{revoked_by.display_name}**"
-        ),
-        color=discord.Color.red()
-    )
-
-    try:
-        await message.edit(
-            content=f"🔁 Consent update: {user_one.mention} ↔ {user_two.mention}",
-            embed=revoked_embed,
-            view=None
-        )
-    except (discord.NotFound, discord.Forbidden):
-        return False
-
-    del guild_messages[key]
-    if not guild_messages:
-        del CONSENT_MESSAGES[guild.id]
-    save_consent_messages()
-    return True
-
-
 class AskConsentView(discord.ui.View):
-    def __init__(self, requester_id: int, target_id: int):
-        super().__init__(timeout=86400)  # 24 hours
+    def __init__(self, requester_id: int, target_id: int, guild_id: int):
+        super().__init__(timeout=86400)
         self.requester_id = requester_id
         self.target_id = target_id
-        self.message = None  # Will be set after send
+        self.guild_id = guild_id
+        self.message = None
 
     async def on_timeout(self):
-        for child in self.children:
-            child.disabled = True
+        if self.message:
+            for child in self.children:
+                child.disabled = True
 
-        timeout_embed = discord.Embed(
-            title="⌛ DM Request Expired",
-            description="This DM request expired after 24 hours.",
-            color=discord.Color.orange()
-        )
+            timeout_embed = discord.Embed(
+                title="⌛ DM Request Expired",
+                description="This DM request expired after 24 hours.",
+                color=discord.Color.orange()
+            )
 
-        try:
-            if self.message:
-                await self.message.edit(embed=timeout_embed, view=self)
-        except discord.NotFound:
-            pass
-        except discord.Forbidden:
-            pass
+            await self.message.edit(embed=timeout_embed, view=self)
+
+    # ✅ BUTTONS MUST LIVE INSIDE CLASS
 
     @discord.ui.button(label="Accept", style=discord.ButtonStyle.success)
     async def accept(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -294,51 +282,41 @@ class AskConsentView(discord.ui.View):
             )
             return
 
-        guild_id = interaction.guild.id
+        guild = interaction.guild
+        requester = guild.get_member(self.requester_id)
+        target = guild.get_member(self.target_id)
 
-        if guild_id not in INTERACTION_PAIRS:
-            INTERACTION_PAIRS[guild_id] = set()
+        if not requester or not target:
+            await interaction.response.send_message(
+                "Could not resolve users.",
+                ephemeral=True
+            )
+            return
 
-        INTERACTION_PAIRS[guild_id].add((self.requester_id, self.target_id))
-        INTERACTION_PAIRS[guild_id].add((self.target_id, self.requester_id))
+        INTERACTION_PAIRS.setdefault(self.guild_id, set())
+        pair_set = INTERACTION_PAIRS[self.guild_id]
 
+        pair_set.add((self.requester_id, self.target_id))
+        pair_set.add((self.target_id, self.requester_id))
         save_consent()
 
         for child in self.children:
             child.disabled = True
 
-        requester = interaction.guild.get_member(self.requester_id)
-        requester_mention = requester.mention if requester else f"<@{self.requester_id}>"
-        target_mention = interaction.user.mention
-
         success_embed = discord.Embed(
             title="✅ DM Permission Granted",
             description=(
-                f"Consent confirmed by both users.\n\n"
-                f"• Requester: {requester_mention}\n"
-                f"• Target: {target_mention}\n\n"
-                "Both users may now DM each other."
+                f"**{requester.display_name}** ↔ **{target.display_name}**\n\n"
+                "Both users may now DM each other.\n"
+                "Permission can be revoked with `/dm_revoke`."
             ),
             color=discord.Color.green()
         )
 
-        if self.message and self.message.channel:
-            guild_messages = CONSENT_MESSAGES.setdefault(interaction.guild.id, {})
-            guild_messages[_pair_key(self.requester_id, self.target_id)] = {
-                "channel_id": self.message.channel.id,
-                "message_id": self.message.id,
-                "requester_id": self.requester_id,
-                "target_id": self.target_id,
-            }
-            save_consent_messages()
-
-        await log_audit_event(
-            interaction.guild,
-            f"DM request accepted: {interaction.user.display_name} ↔ {requester.display_name if requester else self.requester_id}"
-        )
+        await safe_dm_user(requester, success_embed)
+        await safe_dm_user(target, success_embed)
 
         await interaction.response.edit_message(
-            content=f"✅ Consent confirmed: {requester_mention} ↔ {target_mention}",
             embed=success_embed,
             view=self
         )
@@ -357,20 +335,17 @@ class AskConsentView(discord.ui.View):
             child.disabled = True
 
         deny_embed = discord.Embed(
-            title="❌ Consent Denied",
-            description="No permission was granted.",
+            title="❌ DM Request Denied",
+            description="The request was declined.",
             color=discord.Color.red()
-        )
-
-        await log_audit_event(
-            interaction.guild,
-            f"DM request denied by {interaction.user.display_name}"
         )
 
         await interaction.response.edit_message(
             embed=deny_embed,
             view=self
         )
+
+
 
 
 # ==============================
@@ -386,8 +361,8 @@ async def dm_help(interaction: discord.Interaction):
     guild = interaction.guild
 
     embed = discord.Embed(
-        title="📬 DM Request System",
-        description="Control how users may request DM interaction with you.",
+        title="📬 DM Relationship System",
+        description="Control how users may request DM access with you.",
         color=discord.Color.gold()
     )
 
@@ -397,38 +372,53 @@ async def dm_help(interaction: discord.Interaction):
     embed.add_field(
         name="Your DM Modes",
         value=(
-            "**OPEN** — Anyone may DM you.\n"
-            "**ASK** — Requires mutual approval.\n"
-            "**CLOSED** — No one may DM you."
+            "**OPEN** — Anyone may DM.\n"
+            "**ASK** — You must approve requests.\n"
+            "**CLOSED** — DM requests are blocked."
         ),
         inline=False
     )
 
     embed.add_field(
-        name="How Mutual Requests Work",
+        name="How DM Requests Work",
         value=(
-            "• Use `/dm_ask @user` to request permission.\n"
-            "• The other user can Accept or Deny.\n"
-            "• Permissions can be revoked anytime."
+            "• Use `/dm_ask @user` to send a request.\n"
+            "• Requests are sent to the configured request channel.\n"
+            "• The recipient may Accept or Deny.\n"
+            "• Requests expire after 24 hours.\n"
+            "• Relationships persist until revoked."
         ),
         inline=False
     )
 
     embed.add_field(
-        name="Available Commands",
+        name="Your Commands",
         value=(
-            "`/dm_info` — Show your perms and status \n"
+            "`/dm_info` — View your full DM status\n"
             "`/dm_set_mode` — Set your DM preference\n"
-            "`/dm_ask @user` — Request DM access\n"
-            "`/dm_revoke @user` — Revoke permission\n"
-            "`/dm_status @user` — Check status\n"
+            "`/dm_ask @user` — Send DM request\n"
+            "`/dm_revoke @user` — Revoke relationship\n"
+            "`/dm_status @user` — Check relationship status\n"
         ),
         inline=False
     )
 
-    embed.set_footer(text="This system protects consent and clarity.")
+    embed.add_field(
+        name="Moderator Tools",
+        value=(
+            "`/dm_permissions_set` — Manually create relationship\n"
+            "`/dm_permissions_remove` — Remove relationship\n"
+            "`/dm_permissions_list` — View all stored relationships"
+        ),
+        inline=False
+    )
+
+    embed.set_footer(
+        text="DM relationships are logged for audit transparency."
+    )
 
     await interaction.response.send_message(embed=embed, ephemeral=True)
+
 
 @bot.tree.command(
     name="dm_info",
@@ -667,17 +657,41 @@ async def dm_revoke(interaction: discord.Interaction, user: discord.Member):
         pair_set.remove((user.id, interaction.user.id))
         removed = True
 
+    request_channel_id = REQUEST_CHANNELS.get(guild_id)
+    if request_channel_id:
+        channel = interaction.guild.get_channel(request_channel_id)
+        if channel:
+            message_id = DM_REQUESTS.get(guild_id, {}).get((interaction.user.id, user.id))
+            if message_id:
+                try:
+                    msg = await channel.fetch_message(message_id)
+
+                    notify_embed = discord.Embed(
+                        title="🚫 DM Permission Revoked",
+                        description=(
+                            f"**{interaction.user.display_name}** ↔ **{user.display_name}**\n\n"
+                            "You may no longer DM each other."
+                        ),
+                        color=discord.Color.red()
+                    )
+
+                    await safe_dm_user(interaction.user.id, notify_embed)
+                    await safe_dm_user(user2, notify_embed)
+
+                    await msg.edit(embed=revoked_embed, view=None)
+
+                except discord.NotFound:
+                    pass
+
     await log_audit_event(
         interaction.guild,
-        f"DM permission removed: {interaction.user.id} ↔ {user.display_name} (by {interaction.user.display_name})"
+        f"DM permission revoked: {interaction.user.id} ↔ {user.display_name} (by {interaction.user.display_name})"
     )
 
     if removed:
         save_consent()
-        embed_updated = await update_consent_embed_revoked(interaction.guild, interaction.user, user, interaction.user)
-        suffix = " Updated the original request message." if embed_updated else " Could not update the original request message."
         await interaction.response.send_message(
-            f"DM consent revoked with {user.mention}.{suffix}"
+            f"DM consent revoked with {user.mention}."
         )
     else:
         await interaction.response.send_message(
@@ -728,6 +742,8 @@ async def dm_ask(interaction: discord.Interaction, user: discord.Member):
     guild_id = guild.id
     requester = interaction.user
 
+    log.info(f"dm_ask triggered {discord.Member}\n")
+
     # ❌ Self check
     if user.id == requester.id and not DEBUG:
         await interaction.response.send_message(
@@ -765,7 +781,7 @@ async def dm_ask(interaction: discord.Interaction, user: discord.Member):
     # ❌ Existing relationship
     pair_set = INTERACTION_PAIRS.get(guild_id, set())
 
-    if (requester.id, user.id) in pair_set:
+    if is_mutual(guild_id, requester.id, user.id):
         await interaction.response.send_message(
             "A permission relationship already exists.",
             ephemeral=True
@@ -821,7 +837,8 @@ async def dm_ask(interaction: discord.Interaction, user: discord.Member):
     # -------------------------------
     view = AskConsentView(
         requester_id=requester.id,
-        target_id=user.id
+        target_id=user.id,
+        guild_id=guild_id
     )
 
     # -------------------------------
@@ -831,10 +848,17 @@ async def dm_ask(interaction: discord.Interaction, user: discord.Member):
         message = await request_channel.send(
             content=user.mention,
             embed=embed,
-            view=view
+            view=view,
+            allowed_mentions=discord.AllowedMentions(users=[user])
         )
 
+        await message.edit(content=None)
+
         view.message = message
+
+        DM_REQUESTS.setdefault(guild_id, {})
+        DM_REQUESTS[guild_id][(requester.id, user.id)] = message.id
+        save_dm_requests()
 
     except discord.Forbidden:
         await interaction.response.send_message(
@@ -845,9 +869,8 @@ async def dm_ask(interaction: discord.Interaction, user: discord.Member):
 
     await log_audit_event(
         interaction.guild,
-        f"DM request initiated: {interaction.user.display_name} ➝ {user.display_name}"
+        f"DM request asked: {interaction.user.display_name} ➝ {user.display_name}"
     )
-
 
     await interaction.response.send_message(
         f"📨 DM request sent to {request_channel.mention}.",
@@ -1101,6 +1124,71 @@ async def dm_set_audit_channel(interaction: discord.Interaction, channel: discor
         f"📜 Audit logs will now be sent to {channel.mention}."
     )
 
+@bot.tree.command(
+    name="dm_audit_user",
+    description="View DM permission audit history for a user",
+    guild=discord.Object(id=GUILD_ID) if DEBUG else None
+)
+@app_commands.describe(
+    user="User to inspect",
+    limit="Number of recent entries to show (default 10)"
+)
+async def dm_audit_user(
+    interaction: discord.Interaction,
+    user: discord.Member,
+    limit: app_commands.Range[int, 1, 50] = 10
+):
+
+    # Admin only
+    if not interaction.user.guild_permissions.manage_guild:
+        await interaction.response.send_message(
+            "You do not have permission to view audit logs.",
+            ephemeral=True
+        )
+        return
+
+    data = load_audit_log()
+
+    if not data:
+        await interaction.response.send_message(
+            "No audit log entries found.",
+            ephemeral=True
+        )
+        return
+
+    # Filter by guild and user ID appearing in message
+    guild_id = interaction.guild.id
+    filtered = [
+        entry for entry in data
+        if entry["guild_id"] == guild_id and str(user.id) in entry["message"]
+    ]
+
+    if not filtered:
+        await interaction.response.send_message(
+            f"No audit entries found for {user.display_name}.",
+            ephemeral=True
+        )
+        return
+
+    # Get most recent entries
+    filtered = filtered[-limit:]
+
+    lines = []
+    for entry in reversed(filtered):
+        lines.append(f"**{entry['timestamp']}**\n{entry['message']}\n")
+
+    output = "\n".join(lines)
+
+    if len(output) > 3500:
+        output = output[:3500] + "\n... (truncated)"
+
+    embed = discord.Embed(
+        title=f"📜 Audit History — {user.display_name}",
+        description=output,
+        color=discord.Color.blurple()
+    )
+
+    await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
 # ==============================
