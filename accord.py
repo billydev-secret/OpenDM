@@ -57,28 +57,15 @@ class Bot(discord.Client):
 
     async def setup_hook(self):
         if DEBUG:
-            # guild = discord.Object(id=GUILD_ID)
-            # self.tree.clear_commands(guild=guild)
-            # await self.tree.sync(guild=guild)
-            # self.synced = True
-            # log.info("Synced commands to development guild.")
-
             guild = discord.Object(id=GUILD_ID)
-
-            # 1) clear guild commands on Discord
             self.tree.clear_commands(guild=guild)
             await self.tree.sync(guild=guild)
-
-            # 2) copy your (code-defined) global commands into the guild
             self.tree.copy_global_to(guild=guild)
-
-            # 3) sync again to push the updated signature (options)
             await self.tree.sync(guild=guild)
-
-            log.info("Forced guild command refresh complete.")
+            log.info("Synced to dev guild.")
         else:
             await self.tree.sync()
-            log.info("Synced commands globally.")
+            log.info("Synced globally.")
 
 bot = Bot()
 
@@ -397,7 +384,7 @@ def load_consent():
 
     if DEBUG:
         log.info("=== CONSENT STATE AFTER LOAD ===")
-        log.info("Loaded pairs:", INTERACTION_PAIRS)
+        log.info("Loaded pairs: %s", INTERACTION_PAIRS)
 
 
 def save_consent():
