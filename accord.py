@@ -1,37 +1,58 @@
-import os
-import datetime
-import discord
+from __future__ import annotations
 
+import datetime
+import json
+import logging
+import os
+import sqlite3
+from pathlib import Path
+from typing import Any
+
+import discord
 from discord import app_commands
 from dotenv import load_dotenv
-import json
 
 from dm_logic import DM_ROLE_NAMES, ROLE_DM_ASK, ROLE_DM_CLOSED, ROLE_DM_OPEN, resolve_mode
-import logging
 
 # ==============================
 # Configuration
 # ==============================
-load_dotenv()
-TOKEN = os.getenv("DISCORD_TOKEN")
-GUILD_ID = int(os.getenv("GUILD_ID"))
-
-BYPASS_ROLE_IDS = set()
-CONSENT_FILE = "consent_data.json"
-DM_REQUESTS_FILE = "dm_requests.json"
-RELATIONSHIPS_FILE = "dm_relationships.json"
-
-# Relationship metadata (symmetric per pair)
-RELATIONSHIPS = {}
-DEBUG = True  # Set to False when going global
-REQUEST_CHANNELS = {}  # {guild_id: channel_id}
-REQUEST_CHANNEL_FILE = "request_channels.json"
-
 logging.basicConfig(
     level=logging.INFO,
 )
 
-log = logging.getLogger("accord")  # your bot namespace
+log = logging.getLogger("accord")
+
+load_dotenv()
+
+
+def _get_int_env(name: str) -> int | None:
+    raw_value = os.getenv(name)
+    if raw_value in {None, ""}:
+        return None
+
+    try:
+        return int(raw_value)
+    except ValueError:
+        log.warning("Ignoring invalid integer environment variable %s=%r", name, raw_value)
+        return None
+
+
+TOKEN = os.getenv("DISCORD_TOKEN")
+GUILD_ID = _get_int_env("GUILD_ID")
+
+BYPASS_ROLE_IDS = set()
+CONSENT_FILE = Path("consent_data.json")
+DM_REQUESTS_FILE = Path("dm_requests.json")
+RELATIONSHIPS_FILE = Path("dm_relationships.json")
+REQUEST_CHANNEL_FILE = Path("request_channels.json")
+AUDIT_FILE = Path("dm_audit_log.json")
+DB_FILE = Path(os.getenv("ACCORD_DB_FILE", "accord.db"))
+
+# Relationship metadata (symmetric per pair)
+RELATIONSHIPS: dict[int, dict[str, dict[str, Any]]] = {}
+DEBUG = True  # Set to False when going global
+REQUEST_CHANNELS: dict[int, int] = {}
 
 
 # ==============================
@@ -41,11 +62,71 @@ intents = discord.Intents.default()
 intents.members = True
 
 # Interaction Consent State
-INTERACTION_PAIRS = {}        # {channel_id: set(("userA","userB"))}
-DM_REQUESTS = {}  # {guild_id: {(user1_id, user2_id): message_id}}
+INTERACTION_PAIRS: dict[int, set[tuple[int, int]]] = {}
+DM_REQUESTS: dict[int, dict[tuple[int, int], dict[str, Any]]] = {}
+CONSENT_MESSAGES: dict[int, dict[str, dict[str, int]]] = {}
 
 AUDIT_LOG_CHANNEL_ID = None
-AUDIT_FILE = "dm_audit_log.json"
+AUDIT_LOG_CHANNELS: dict[int, int] = {}
+
+
+def _connect_db() -> sqlite3.Connection:
+    conn = sqlite3.connect(DB_FILE)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def _load_json_file(path: Path, default: Any) -> Any:
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            return json.load(handle)
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return default
+
+
+def _get_metadata(conn: sqlite3.Connection, key: str) -> str | None:
+    row = conn.execute("SELECT value FROM metadata WHERE key = ?", (key,)).fetchone()
+    if row is None:
+        return None
+    return str(row["value"])
+
+
+def _set_metadata(conn: sqlite3.Connection, key: str, value: str) -> None:
+    conn.execute(
+        """
+        INSERT INTO metadata(key, value)
+        VALUES(?, ?)
+        ON CONFLICT(key) DO UPDATE SET value = excluded.value
+        """,
+        (key, value),
+    )
+
+
+def _database_has_state(conn: sqlite3.Connection) -> bool:
+    for table_name in (
+        "consent_pairs",
+        "relationships",
+        "dm_requests",
+        "request_channels",
+        "audit_channels",
+        "audit_log",
+    ):
+        if conn.execute(f"SELECT 1 FROM {table_name} LIMIT 1").fetchone() is not None:
+            return True
+    return False
+
+
+def _iter_unique_pair_rows(pairs_by_guild: dict[int, set[tuple[int, int]]]):
+    for guild_id, pairs in pairs_by_guild.items():
+        seen: set[tuple[int, int]] = set()
+        for a, b in pairs:
+            if a == b:
+                continue
+            lo, hi = (a, b) if a < b else (b, a)
+            if (lo, hi) in seen:
+                continue
+            seen.add((lo, hi))
+            yield guild_id, lo, hi
 
 # ==============================
 # Bot Class
@@ -56,14 +137,17 @@ class Bot(discord.Client):
         self.tree = app_commands.CommandTree(self)
 
     async def setup_hook(self):
-        if DEBUG:
+        ensure_database()
+
+        if DEBUG and GUILD_ID is not None:
             guild = discord.Object(id=GUILD_ID)
             self.tree.clear_commands(guild=guild)
-            await self.tree.sync(guild=guild)
             self.tree.copy_global_to(guild=guild)
             await self.tree.sync(guild=guild)
             log.info("Synced to dev guild.")
         else:
+            if DEBUG and GUILD_ID is None:
+                log.warning("DEBUG is enabled but GUILD_ID is not set. Syncing commands globally.")
             await self.tree.sync()
             log.info("Synced globally.")
 
@@ -80,11 +164,10 @@ async def on_ready():
     load_relationships()
     reconcile_relationship_defaults()
     load_request_channels()
+    load_audit_channels()
 
 @bot.event
 async def on_member_update(before: discord.Member, after: discord.Member):
-
-    before_dm = [r for r in before.roles if r.name in DM_ROLE_NAMES]
     after_dm = [r for r in after.roles if r.name in DM_ROLE_NAMES]
 
     # If more than one DM role exists after update
@@ -103,13 +186,21 @@ async def on_member_update(before: discord.Member, after: discord.Member):
 @bot.event
 async def on_disconnect():
     save_consent()
+    save_dm_requests()
+    save_relationships()
+    save_request_channels()
+    save_audit_channels()
 
 # ==============================
 # Logic
 # ==============================
-async def safe_dm_user(user: discord.User | discord.Member, embed: discord.Embed):
+async def safe_dm_user(user: Any, embed: discord.Embed):
+    sender = getattr(user, "send", None)
+    if sender is None:
+        return
+
     try:
-        await user.send(embed=embed)
+        await sender(embed=embed)
     except discord.Forbidden:
         # User has DMs closed or blocked the bot
         pass
@@ -117,12 +208,45 @@ async def safe_dm_user(user: discord.User | discord.Member, embed: discord.Embed
         pass
 
 
-def load_audit_log():
-    try:
-        with open(AUDIT_FILE, "r") as f:
-            return json.load(f)
-    except FileNotFoundError:
-        return []
+def load_audit_log(
+    guild_id: int | None = None,
+    user_id: int | None = None,
+    limit: int | None = None,
+) -> list[dict[str, Any]]:
+    ensure_database()
+
+    query = [
+        """
+        SELECT timestamp, guild_id, action, message, actor_id, user1_id, user2_id, request_type
+        FROM audit_log
+        """
+    ]
+    params: list[Any] = []
+    clauses: list[str] = []
+
+    if guild_id is not None:
+        clauses.append("guild_id = ?")
+        params.append(guild_id)
+
+    if user_id is not None:
+        clauses.append("(actor_id = ? OR user1_id = ? OR user2_id = ?)")
+        params.extend([user_id, user_id, user_id])
+
+    if clauses:
+        query.append("WHERE " + " AND ".join(clauses))
+
+    if limit is not None:
+        query.append("ORDER BY id DESC LIMIT ?")
+        params.append(limit)
+        sql = "SELECT * FROM (" + " ".join(query) + ") ORDER BY timestamp ASC"
+    else:
+        query.append("ORDER BY timestamp ASC")
+        sql = " ".join(query)
+
+    with _connect_db() as conn:
+        rows = conn.execute(sql, params).fetchall()
+
+    return [dict(row) for row in rows]
 
 
 def is_mutual(guild_id: int, user1: int, user2: int) -> bool:
@@ -150,39 +274,341 @@ def _relationship_key(a: int, b: int) -> str:
     lo, hi = (a, b) if a < b else (b, a)
     return f"{lo}-{hi}"
 
-def load_relationships():
-    """Load relationship metadata (symmetric) from disk."""
-    global RELATIONSHIPS
-    try:
-        with open(RELATIONSHIPS_FILE, "r") as f:
-            raw = json.load(f)
 
-        out: dict[int, dict[str, dict]] = {}
-        if isinstance(raw, dict):
-            for g, pairs in raw.items():
+def ensure_database() -> None:
+    with _connect_db() as conn:
+        conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS metadata (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS consent_pairs (
+                guild_id INTEGER NOT NULL,
+                user_low INTEGER NOT NULL,
+                user_high INTEGER NOT NULL,
+                PRIMARY KEY (guild_id, user_low, user_high)
+            );
+
+            CREATE TABLE IF NOT EXISTS relationships (
+                guild_id INTEGER NOT NULL,
+                pair_key TEXT NOT NULL,
+                request_type TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                created_at TEXT,
+                source_channel_id INTEGER,
+                source_message_id INTEGER,
+                PRIMARY KEY (guild_id, pair_key)
+            );
+
+            CREATE TABLE IF NOT EXISTS dm_requests (
+                guild_id INTEGER NOT NULL,
+                requester_id INTEGER NOT NULL,
+                target_id INTEGER NOT NULL,
+                message_id INTEGER NOT NULL,
+                request_type TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                created_at TEXT,
+                PRIMARY KEY (guild_id, requester_id, target_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS request_channels (
+                guild_id INTEGER PRIMARY KEY,
+                channel_id INTEGER NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS audit_channels (
+                guild_id INTEGER PRIMARY KEY,
+                channel_id INTEGER NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS audit_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT NOT NULL,
+                guild_id INTEGER NOT NULL,
+                action TEXT NOT NULL,
+                message TEXT NOT NULL,
+                actor_id INTEGER,
+                user1_id INTEGER,
+                user2_id INTEGER,
+                request_type TEXT
+            );
+            """
+        )
+
+        if _get_metadata(conn, "legacy_json_migrated") == "1":
+            return
+
+        if _database_has_state(conn):
+            _set_metadata(conn, "legacy_json_migrated", "1")
+            return
+
+        legacy_consents = _load_json_file(CONSENT_FILE, {})
+        if isinstance(legacy_consents, dict):
+            consent_rows = []
+            for guild_id_str, pairs in legacy_consents.items():
                 try:
-                    gid = int(g)
-                except ValueError:
+                    guild_id = int(guild_id_str)
+                except (TypeError, ValueError):
                     continue
 
-                out[gid] = {}
-                if isinstance(pairs, dict):
-                    for k, meta in pairs.items():
-                        if isinstance(meta, dict):
-                            out[gid][k] = meta
+                seen: set[tuple[int, int]] = set()
+                for pair in pairs if isinstance(pairs, list) else []:
+                    try:
+                        a, b = map(int, pair)
+                    except (TypeError, ValueError):
+                        continue
+                    if a == b:
+                        continue
+                    lo, hi = (a, b) if a < b else (b, a)
+                    if (lo, hi) in seen:
+                        continue
+                    seen.add((lo, hi))
+                    consent_rows.append((guild_id, lo, hi))
 
-        RELATIONSHIPS = out
-    except FileNotFoundError:
-        RELATIONSHIPS = {}
+            if consent_rows:
+                conn.executemany(
+                    """
+                    INSERT OR IGNORE INTO consent_pairs(guild_id, user_low, user_high)
+                    VALUES(?, ?, ?)
+                    """,
+                    consent_rows,
+                )
+
+        legacy_relationships = _load_json_file(RELATIONSHIPS_FILE, {})
+        if isinstance(legacy_relationships, dict):
+            relationship_rows = []
+            for guild_id_str, pairs in legacy_relationships.items():
+                try:
+                    guild_id = int(guild_id_str)
+                except (TypeError, ValueError):
+                    continue
+
+                if not isinstance(pairs, dict):
+                    continue
+
+                for pair_key, meta in pairs.items():
+                    if not isinstance(meta, dict):
+                        continue
+                    relationship_rows.append(
+                        (
+                            guild_id,
+                            pair_key,
+                            _normalize_request_type(meta.get("type")),
+                            (meta.get("reason") or "").strip(),
+                            meta.get("created_at"),
+                            None,
+                            None,
+                        )
+                    )
+
+            if relationship_rows:
+                conn.executemany(
+                    """
+                    INSERT OR REPLACE INTO relationships(
+                        guild_id, pair_key, request_type, reason, created_at, source_channel_id, source_message_id
+                    )
+                    VALUES(?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    relationship_rows,
+                )
+
+        legacy_requests = _load_json_file(DM_REQUESTS_FILE, {})
+        if isinstance(legacy_requests, dict):
+            request_rows = []
+            for guild_id_str, pairs in legacy_requests.items():
+                try:
+                    guild_id = int(guild_id_str)
+                except (TypeError, ValueError):
+                    continue
+
+                if not isinstance(pairs, dict):
+                    continue
+
+                for key, value in pairs.items():
+                    try:
+                        requester_id, target_id = map(int, key.split("-"))
+                    except (AttributeError, TypeError, ValueError):
+                        continue
+
+                    if isinstance(value, int):
+                        record = {
+                            "message_id": value,
+                            "request_type": "dm",
+                            "reason": "",
+                            "created_at": None,
+                        }
+                    elif isinstance(value, dict):
+                        record = {
+                            "message_id": int(value.get("message_id") or 0),
+                            "request_type": _normalize_request_type(value.get("request_type") or value.get("type")),
+                            "reason": (value.get("reason") or "").strip(),
+                            "created_at": value.get("created_at"),
+                        }
+                    else:
+                        continue
+
+                    if record["message_id"] <= 0:
+                        continue
+
+                    request_rows.append(
+                        (
+                            guild_id,
+                            requester_id,
+                            target_id,
+                            record["message_id"],
+                            record["request_type"],
+                            record["reason"],
+                            record["created_at"],
+                        )
+                    )
+
+            if request_rows:
+                conn.executemany(
+                    """
+                    INSERT OR REPLACE INTO dm_requests(
+                        guild_id, requester_id, target_id, message_id, request_type, reason, created_at
+                    )
+                    VALUES(?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    request_rows,
+                )
+
+        legacy_request_channels = _load_json_file(REQUEST_CHANNEL_FILE, {})
+        if isinstance(legacy_request_channels, dict):
+            request_channel_rows = []
+            for guild_id_str, channel_id in legacy_request_channels.items():
+                try:
+                    request_channel_rows.append((int(guild_id_str), int(channel_id)))
+                except (TypeError, ValueError):
+                    continue
+
+            if request_channel_rows:
+                conn.executemany(
+                    """
+                    INSERT OR REPLACE INTO request_channels(guild_id, channel_id)
+                    VALUES(?, ?)
+                    """,
+                    request_channel_rows,
+                )
+
+        legacy_audit_entries = _load_json_file(AUDIT_FILE, [])
+        if isinstance(legacy_audit_entries, list):
+            audit_rows = []
+            for entry in legacy_audit_entries:
+                if not isinstance(entry, dict):
+                    continue
+                try:
+                    guild_id = int(entry["guild_id"])
+                except (KeyError, TypeError, ValueError):
+                    continue
+
+                audit_rows.append(
+                    (
+                        entry.get("timestamp") or datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC"),
+                        guild_id,
+                        entry.get("action") or "legacy",
+                        entry.get("message") or "",
+                        None,
+                        None,
+                        None,
+                        entry.get("request_type"),
+                    )
+                )
+
+            if audit_rows:
+                conn.executemany(
+                    """
+                    INSERT INTO audit_log(
+                        timestamp, guild_id, action, message, actor_id, user1_id, user2_id, request_type
+                    )
+                    VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    audit_rows,
+                )
+
+        _set_metadata(conn, "legacy_json_migrated", "1")
+
+        if (
+            legacy_consents
+            or legacy_relationships
+            or legacy_requests
+            or legacy_request_channels
+            or legacy_audit_entries
+        ):
+            log.info("Migrated legacy JSON state into %s", DB_FILE)
+
+def load_relationships():
+    """Load relationship metadata (symmetric) from SQLite."""
+    global RELATIONSHIPS
+    ensure_database()
+    out: dict[int, dict[str, dict[str, Any]]] = {}
+
+    with _connect_db() as conn:
+        rows = conn.execute(
+            """
+            SELECT guild_id, pair_key, request_type, reason, created_at, source_channel_id, source_message_id
+            FROM relationships
+            """
+        ).fetchall()
+
+    for row in rows:
+        guild_id = int(row["guild_id"])
+        out.setdefault(guild_id, {})
+        out[guild_id][str(row["pair_key"])] = {
+            "type": _normalize_request_type(row["request_type"]),
+            "reason": (row["reason"] or "").strip(),
+            "created_at": row["created_at"],
+            "source_channel_id": row["source_channel_id"],
+            "source_message_id": row["source_message_id"],
+        }
+
+    RELATIONSHIPS = out
+    rebuild_consent_messages()
 
 def save_relationships():
-    out: dict[str, dict[str, dict]] = {}
-    for gid, pairs in RELATIONSHIPS.items():
-        out[str(gid)] = pairs
-    with open(RELATIONSHIPS_FILE, "w") as f:
-        json.dump(out, f, indent=4)
+    ensure_database()
+    rows = []
+    for guild_id, pairs in RELATIONSHIPS.items():
+        for pair_key, meta in pairs.items():
+            rows.append(
+                (
+                    guild_id,
+                    pair_key,
+                    _normalize_request_type(meta.get("type")),
+                    (meta.get("reason") or "").strip(),
+                    meta.get("created_at"),
+                    meta.get("source_channel_id"),
+                    meta.get("source_message_id"),
+                )
+            )
 
-def set_relationship_meta(guild_id: int, a: int, b: int, request_type: str, reason: str | None):
+    with _connect_db() as conn:
+        conn.execute("DELETE FROM relationships")
+        if rows:
+            conn.executemany(
+                """
+                INSERT INTO relationships(
+                    guild_id, pair_key, request_type, reason, created_at, source_channel_id, source_message_id
+                )
+                VALUES(?, ?, ?, ?, ?, ?, ?)
+                """,
+                rows,
+            )
+
+    rebuild_consent_messages()
+
+def set_relationship_meta(
+    guild_id: int,
+    a: int,
+    b: int,
+    request_type: str,
+    reason: str | None,
+    *,
+    source_channel_id: int | None = None,
+    source_message_id: int | None = None,
+):
     """Set (or update) symmetric metadata for a relationship."""
     key = _relationship_key(a, b)
     RELATIONSHIPS.setdefault(guild_id, {})
@@ -192,7 +618,9 @@ def set_relationship_meta(guild_id: int, a: int, b: int, request_type: str, reas
     RELATIONSHIPS[guild_id][key] = {
         "type": _normalize_request_type(request_type),
         "reason": (reason or "").strip(),
-        "created_at": created_at
+        "created_at": created_at,
+        "source_channel_id": source_channel_id if source_channel_id is not None else existing.get("source_channel_id"),
+        "source_message_id": source_message_id if source_message_id is not None else existing.get("source_message_id"),
     }
 
 def get_relationship_meta(guild_id: int, a: int, b: int) -> dict:
@@ -200,11 +628,19 @@ def get_relationship_meta(guild_id: int, a: int, b: int) -> dict:
     key = _relationship_key(a, b)
     meta = RELATIONSHIPS.get(guild_id, {}).get(key)
     if not isinstance(meta, dict):
-        return {"type": "dm", "reason": "", "created_at": None}
+        return {
+            "type": "dm",
+            "reason": "",
+            "created_at": None,
+            "source_channel_id": None,
+            "source_message_id": None,
+        }
     return {
         "type": _normalize_request_type(meta.get("type")),
         "reason": (meta.get("reason") or "").strip(),
-        "created_at": meta.get("created_at")
+        "created_at": meta.get("created_at"),
+        "source_channel_id": meta.get("source_channel_id"),
+        "source_message_id": meta.get("source_message_id"),
     }
 
 def delete_relationship_meta(guild_id: int, a: int, b: int):
@@ -247,96 +683,114 @@ def reconcile_relationship_defaults():
         save_relationships()
 
 def load_dm_requests():
-    """
-    Load DM request records from disk.
-
-    Backward compatible:
-      - old format: value is int message_id
-      - new format: value is dict {message_id, request_type, reason, created_at}
-    """
+    """Load pending DM request records from SQLite."""
     global DM_REQUESTS
-    try:
-        with open(DM_REQUESTS_FILE, "r") as f:
-            raw = json.load(f)
+    ensure_database()
+    out: dict[int, dict[tuple[int, int], dict[str, Any]]] = {}
 
-        out: dict[int, dict[tuple[int, int], dict]] = {}
+    with _connect_db() as conn:
+        rows = conn.execute(
+            """
+            SELECT guild_id, requester_id, target_id, message_id, request_type, reason, created_at
+            FROM dm_requests
+            """
+        ).fetchall()
 
-        if isinstance(raw, dict):
-            for g, pairs in raw.items():
-                try:
-                    gid = int(g)
-                except ValueError:
-                    continue
-
-                out[gid] = {}
-                if not isinstance(pairs, dict):
-                    continue
-
-                for k, v in pairs.items():
-                    try:
-                        a, b = map(int, k.split("-"))
-                    except Exception:
-                        continue
-
-                    if isinstance(v, int):
-                        out[gid][(a, b)] = {
-                            "message_id": v,
-                            "request_type": "dm",
-                            "reason": "",
-                            "created_at": None
-                        }
-                    elif isinstance(v, dict):
-                        out[gid][(a, b)] = {
-                            "message_id": int(v.get("message_id") or 0),
-                            "request_type": _normalize_request_type(v.get("request_type") or v.get("type") or "dm"),
-                            "reason": (v.get("reason") or "").strip(),
-                            "created_at": v.get("created_at")
-                        }
-
-        DM_REQUESTS = out
-    except FileNotFoundError:
-        DM_REQUESTS = {}
-
-def save_dm_requests():
-    output: dict[str, dict[str, dict]] = {}
-    for guild_id, pairs in DM_REQUESTS.items():
-        output[str(guild_id)] = {
-            f"{a}-{b}": rec
-            for (a, b), rec in pairs.items()
+    for row in rows:
+        guild_id = int(row["guild_id"])
+        out.setdefault(guild_id, {})
+        out[guild_id][(int(row["requester_id"]), int(row["target_id"]))] = {
+            "message_id": int(row["message_id"]),
+            "request_type": _normalize_request_type(row["request_type"]),
+            "reason": (row["reason"] or "").strip(),
+            "created_at": row["created_at"],
         }
 
-    with open(DM_REQUESTS_FILE, "w") as f:
-        json.dump(output, f, indent=4)
+    DM_REQUESTS = out
+
+def save_dm_requests():
+    ensure_database()
+    rows = []
+    for guild_id, pairs in DM_REQUESTS.items():
+        for (requester_id, target_id), record in pairs.items():
+            message_id = int(record.get("message_id") or 0)
+            if message_id <= 0:
+                continue
+            rows.append(
+                (
+                    guild_id,
+                    requester_id,
+                    target_id,
+                    message_id,
+                    _normalize_request_type(record.get("request_type")),
+                    (record.get("reason") or "").strip(),
+                    record.get("created_at"),
+                )
+            )
+
+    with _connect_db() as conn:
+        conn.execute("DELETE FROM dm_requests")
+        if rows:
+            conn.executemany(
+                """
+                INSERT INTO dm_requests(
+                    guild_id, requester_id, target_id, message_id, request_type, reason, created_at
+                )
+                VALUES(?, ?, ?, ?, ?, ?, ?)
+                """,
+                rows,
+            )
 
 
-async def log_audit_event(guild: discord.Guild, message: str):
+async def log_audit_event(
+    guild: discord.Guild,
+    message: str,
+    *,
+    action: str = "generic",
+    actor_id: int | None = None,
+    user1_id: int | None = None,
+    user2_id: int | None = None,
+    request_type: str | None = None,
+):
     global AUDIT_LOG_CHANNEL_ID
 
     timestamp = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+    ensure_database()
 
-    log_entry = {
-        "timestamp": timestamp,
-        "guild_id": guild.id,
-        "message": message
-    }
+    with _connect_db() as conn:
+        conn.execute(
+            """
+            INSERT INTO audit_log(timestamp, guild_id, action, message, actor_id, user1_id, user2_id, request_type)
+            VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                timestamp,
+                guild.id,
+                action,
+                message,
+                actor_id,
+                user1_id,
+                user2_id,
+                _normalize_request_type(request_type) if request_type else None,
+            ),
+        )
 
-    # Append to JSON file
-    try:
-        with open(AUDIT_FILE, "r") as f:
-            data = json.load(f)
-    except FileNotFoundError:
-        data = []
-
-    data.append(log_entry)
-
-    with open(AUDIT_FILE, "w") as f:
-        json.dump(data, f, indent=4)
-
-    log.info(log_entry)
+    log.info(
+        {
+            "timestamp": timestamp,
+            "guild_id": guild.id,
+            "action": action,
+            "message": message,
+            "actor_id": actor_id,
+            "user1_id": user1_id,
+            "user2_id": user2_id,
+        }
+    )
 
     # Send to audit channel if configured
-    if AUDIT_LOG_CHANNEL_ID:
-        channel = guild.get_channel(AUDIT_LOG_CHANNEL_ID)
+    channel_id = AUDIT_LOG_CHANNELS.get(guild.id) or AUDIT_LOG_CHANNEL_ID
+    if channel_id:
+        channel = guild.get_channel(channel_id)
         if channel:
             embed = discord.Embed(
                 title="📜 DM Permission Audit",
@@ -349,38 +803,62 @@ async def log_audit_event(guild: discord.Guild, message: str):
 
 def load_request_channels():
     global REQUEST_CHANNELS
-    try:
-        with open(REQUEST_CHANNEL_FILE, "r") as f:
-            raw = json.load(f)
-            REQUEST_CHANNELS = {int(k): v for k, v in raw.items()}
-    except FileNotFoundError:
-        REQUEST_CHANNELS = {}
+    ensure_database()
+    with _connect_db() as conn:
+        rows = conn.execute("SELECT guild_id, channel_id FROM request_channels").fetchall()
+    REQUEST_CHANNELS = {int(row["guild_id"]): int(row["channel_id"]) for row in rows}
 
 def save_request_channels():
-    with open(REQUEST_CHANNEL_FILE, "w") as f:
-        json.dump(REQUEST_CHANNELS, f, indent=4)
+    ensure_database()
+    rows = [(guild_id, channel_id) for guild_id, channel_id in REQUEST_CHANNELS.items()]
+    with _connect_db() as conn:
+        conn.execute("DELETE FROM request_channels")
+        if rows:
+            conn.executemany(
+                "INSERT INTO request_channels(guild_id, channel_id) VALUES(?, ?)",
+                rows,
+            )
+
+
+def load_audit_channels():
+    global AUDIT_LOG_CHANNELS
+    global AUDIT_LOG_CHANNEL_ID
+
+    ensure_database()
+    with _connect_db() as conn:
+        rows = conn.execute("SELECT guild_id, channel_id FROM audit_channels").fetchall()
+
+    AUDIT_LOG_CHANNELS = {int(row["guild_id"]): int(row["channel_id"]) for row in rows}
+    AUDIT_LOG_CHANNEL_ID = next(iter(AUDIT_LOG_CHANNELS.values()), None)
+
+
+def save_audit_channels():
+    ensure_database()
+    rows = [(guild_id, channel_id) for guild_id, channel_id in AUDIT_LOG_CHANNELS.items()]
+    with _connect_db() as conn:
+        conn.execute("DELETE FROM audit_channels")
+        if rows:
+            conn.executemany(
+                "INSERT INTO audit_channels(guild_id, channel_id) VALUES(?, ?)",
+                rows,
+            )
 
 
 def load_consent():
     global INTERACTION_PAIRS
+    ensure_database()
     INTERACTION_PAIRS = {}
 
-    try:
-        with open(CONSENT_FILE, "r") as f:
-            raw = json.load(f)
+    with _connect_db() as conn:
+        rows = conn.execute("SELECT guild_id, user_low, user_high FROM consent_pairs").fetchall()
 
-        for guild_id_str, pairs in raw.items():
-            guild_id = int(guild_id_str)
-            INTERACTION_PAIRS[guild_id] = set()
-
-            for a, b in pairs:
-                if a == b:
-                    continue
-                INTERACTION_PAIRS[guild_id].add((a, b))
-                INTERACTION_PAIRS[guild_id].add((b, a))
-
-    except FileNotFoundError:
-        INTERACTION_PAIRS = {}
+    for row in rows:
+        guild_id = int(row["guild_id"])
+        a = int(row["user_low"])
+        b = int(row["user_high"])
+        INTERACTION_PAIRS.setdefault(guild_id, set())
+        INTERACTION_PAIRS[guild_id].add((a, b))
+        INTERACTION_PAIRS[guild_id].add((b, a))
 
     if DEBUG:
         log.info("=== CONSENT STATE AFTER LOAD ===")
@@ -388,21 +866,54 @@ def load_consent():
 
 
 def save_consent():
-    output = {}
+    ensure_database()
+    rows = list(_iter_unique_pair_rows(INTERACTION_PAIRS))
 
-    for guild_id, pairs in INTERACTION_PAIRS.items():
-        unique_pairs = set()
+    with _connect_db() as conn:
+        conn.execute("DELETE FROM consent_pairs")
+        if rows:
+            conn.executemany(
+                """
+                INSERT INTO consent_pairs(guild_id, user_low, user_high)
+                VALUES(?, ?, ?)
+                """,
+                rows,
+            )
 
-        for a, b in pairs:
-            if (b, a) not in unique_pairs:
-                unique_pairs.add((a, b))
 
-        output[str(guild_id)] = [
-            [a, b] for a, b in unique_pairs
-        ]
+def rebuild_consent_messages():
+    global CONSENT_MESSAGES
+    out: dict[int, dict[str, dict[str, int]]] = {}
+    for guild_id, pairs in RELATIONSHIPS.items():
+        for pair_key, meta in pairs.items():
+            channel_id = meta.get("source_channel_id")
+            message_id = meta.get("source_message_id")
+            if not channel_id or not message_id:
+                continue
 
-    with open(CONSENT_FILE, "w") as f:
-        json.dump(output, f, indent=4)
+            try:
+                a_str, b_str = pair_key.split("-")
+                requester_id = int(a_str)
+                target_id = int(b_str)
+            except (AttributeError, TypeError, ValueError):
+                continue
+
+            out.setdefault(guild_id, {})[f"{requester_id}:{target_id}"] = {
+                "channel_id": int(channel_id),
+                "message_id": int(message_id),
+                "requester_id": requester_id,
+                "target_id": target_id,
+            }
+
+    CONSENT_MESSAGES = out
+
+
+def load_consent_messages():
+    rebuild_consent_messages()
+
+
+def save_consent_messages():
+    rebuild_consent_messages()
 
 
 class AskConsentView(discord.ui.View):
@@ -410,7 +921,7 @@ class AskConsentView(discord.ui.View):
         self,
         requester_id: int,
         target_id: int,
-        guild_id: int,
+        guild_id: int = 0,
         request_type: str = "dm",
         reason: str = ""
     ):
@@ -485,8 +996,20 @@ class AskConsentView(discord.ui.View):
         save_consent()
 
         # Persist relationship metadata (symmetric)
-        set_relationship_meta(self.guild_id, self.requester_id, self.target_id, self.request_type, self.reason)
+        set_relationship_meta(
+            self.guild_id,
+            self.requester_id,
+            self.target_id,
+            self.request_type,
+            self.reason,
+            source_channel_id=getattr(getattr(self.message, "channel", None), "id", None),
+            source_message_id=getattr(self.message, "id", None),
+        )
         save_relationships()
+        save_consent_messages()
+
+        self._clear_request_record()
+        save_dm_requests()
 
         for child in self.children:
             child.disabled = True
@@ -499,6 +1022,14 @@ class AskConsentView(discord.ui.View):
                 "Permission can be revoked with `/dm_revoke`."
             ),
             color=discord.Color.green()
+        )
+
+        success_embed.description = (
+            f"**{requester.display_name}** <-> **{target.display_name}**\n"
+            f"Requester: {getattr(requester, 'mention', requester.display_name)}\n"
+            f"Target: {getattr(target, 'mention', target.display_name)}\n\n"
+            "Both users may now DM each other.\n"
+            "Permission can be revoked with `/dm_revoke`."
         )
 
         success_embed.add_field(
@@ -576,6 +1107,8 @@ async def dm_help(interaction: discord.Interaction):
         description="Control how users may request DM access with you.",
         color=discord.Color.gold()
     )
+
+    embed.title = "📬 DM Request System"
 
     if guild.icon:
         embed.set_thumbnail(url=guild.icon.url)
@@ -876,8 +1409,18 @@ async def dm_revoke(interaction: discord.Interaction, user: discord.Member):
         pair_set.remove((user.id, interaction.user.id))
         removed = True
 
+    if not removed:
+        await interaction.response.send_message(
+            "No mutual consent existed.",
+            ephemeral=True
+        )
+        return
+
     # Pull relationship meta (defaults to DM if missing)
     meta = get_relationship_meta(guild_id, interaction.user.id, user.id)
+    legacy_record = CONSENT_MESSAGES.get(guild_id, {}).get(f"{interaction.user.id}:{user.id}")
+    if legacy_record is None:
+        legacy_record = CONSENT_MESSAGES.get(guild_id, {}).get(f"{user.id}:{interaction.user.id}")
 
     revoked_embed = discord.Embed(
         title="🚫 DM Permission Revoked",
@@ -901,21 +1444,23 @@ async def dm_revoke(interaction: discord.Interaction, user: discord.Member):
     # Remove relationship metadata
     delete_relationship_meta(guild_id, interaction.user.id, user.id)
     save_relationships()
+    consent_records = CONSENT_MESSAGES.get(guild_id, {})
+    consent_records.pop(f"{interaction.user.id}:{user.id}", None)
+    consent_records.pop(f"{user.id}:{interaction.user.id}", None)
+    if not consent_records and guild_id in CONSENT_MESSAGES:
+        del CONSENT_MESSAGES[guild_id]
 
-    # Try to update the original request message (if we have it recorded)
-    request_channel_id = REQUEST_CHANNELS.get(guild_id)
+    # Try to update the original request message when we have a stored location.
+    request_channel_id = meta.get("source_channel_id") or REQUEST_CHANNELS.get(guild_id)
+    if not meta.get("source_message_id") and legacy_record:
+        request_channel_id = legacy_record.get("channel_id") or request_channel_id
+
     if request_channel_id:
         channel = interaction.guild.get_channel(request_channel_id)
         if channel:
-            rec = DM_REQUESTS.get(guild_id, {}).get((interaction.user.id, user.id))
-            if not rec:
-                rec = DM_REQUESTS.get(guild_id, {}).get((user.id, interaction.user.id))
-
-            message_id = None
-            if isinstance(rec, int):
-                message_id = rec
-            elif isinstance(rec, dict):
-                message_id = rec.get("message_id")
+            message_id = meta.get("source_message_id")
+            if not message_id and legacy_record:
+                message_id = legacy_record.get("message_id")
 
             if message_id:
                 try:
@@ -926,6 +1471,23 @@ async def dm_revoke(interaction: discord.Interaction, user: discord.Member):
 
     await safe_dm_user(interaction.user, revoked_embed)
     await safe_dm_user(user, revoked_embed)
+
+    save_consent()
+
+    await log_audit_event(
+        interaction.guild,
+        f"DM permission revoked: {interaction.user.display_name} <-> {user.display_name} (by {interaction.user.display_name})",
+        action="relationship_revoked",
+        actor_id=interaction.user.id,
+        user1_id=interaction.user.id,
+        user2_id=user.id,
+        request_type=meta.get("type"),
+    )
+
+    await interaction.response.send_message(
+        f"DM consent revoked with {user.mention}."
+    )
+    return
 
     await log_audit_event(
         interaction.guild,
@@ -1194,13 +1756,13 @@ async def debug_status_check(interaction: discord.Interaction):
     status = "OPEN"
     explanation = "Anyone may DM you."
 
-    if "DMs: CLOSED" in role_names:
+    if ROLE_DM_CLOSED in role_names:
         status = "CLOSED"
         explanation = "No one may DM you."
-    elif "DMs: ASK" in role_names:
+    elif ROLE_DM_ASK in role_names:
         status = "ASK"
         explanation = "Mutual consent required before mentions."
-    elif "DMs: OPEN" in role_names:
+    elif ROLE_DM_OPEN in role_names:
         status = "OPEN"
         explanation = "Anyone may DM you."
 
@@ -1393,6 +1955,8 @@ async def dm_set_audit_channel(interaction: discord.Interaction, channel: discor
 
     global AUDIT_LOG_CHANNEL_ID
     AUDIT_LOG_CHANNEL_ID = channel.id
+    AUDIT_LOG_CHANNELS[interaction.guild.id] = channel.id
+    save_audit_channels()
 
     await interaction.response.send_message(
         f"📜 Audit logs will now be sent to {channel.mention}."
@@ -1420,7 +1984,14 @@ async def dm_audit_user(
         )
         return
 
-    data = load_audit_log()
+    guild_id = interaction.guild.id
+    data = load_audit_log(guild_id=guild_id, user_id=user.id, limit=limit)
+
+    if not data:
+        data = [
+            entry for entry in load_audit_log(guild_id=guild_id)
+            if user.display_name in entry["message"] or str(user.id) in entry["message"]
+        ][-limit:]
 
     if not data:
         await interaction.response.send_message(
@@ -1429,25 +2000,8 @@ async def dm_audit_user(
         )
         return
 
-    # Filter by guild and user ID appearing in message
-    guild_id = interaction.guild.id
-    filtered = [
-        entry for entry in data
-        if entry["guild_id"] == guild_id and str(user.id) in entry["message"]
-    ]
-
-    if not filtered:
-        await interaction.response.send_message(
-            f"No audit entries found for {user.display_name}.",
-            ephemeral=True
-        )
-        return
-
-    # Get most recent entries
-    filtered = filtered[-limit:]
-
     lines = []
-    for entry in reversed(filtered):
+    for entry in reversed(data):
         lines.append(f"**{entry['timestamp']}**\n{entry['message']}\n")
 
     output = "\n".join(lines)
@@ -1467,6 +2021,7 @@ async def dm_audit_user(
 # ==============================
 # Run Bot
 # ==============================
-
 if __name__ == "__main__":
+    if not TOKEN:
+        raise RuntimeError("DISCORD_TOKEN is not set.")
     bot.run(TOKEN)
