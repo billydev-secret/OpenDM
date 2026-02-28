@@ -38,8 +38,17 @@ def _get_int_env(name: str) -> int | None:
         return None
 
 
+def _get_bool_env(name: str, default: bool) -> bool:
+    raw_value = os.getenv(name)
+    if raw_value in {None, ""}:
+        return default
+
+    return raw_value.strip().lower() in {"1", "true", "yes", "on"}
+
+
 TOKEN = os.getenv("DISCORD_TOKEN")
 GUILD_ID = _get_int_env("GUILD_ID")
+DEBUG = _get_bool_env("DEBUG", False)
 
 BYPASS_ROLE_IDS = set()
 CONSENT_FILE = Path("consent_data.json")
@@ -51,7 +60,6 @@ DB_FILE = Path(os.getenv("ACCORD_DB_FILE", "accord.db"))
 
 # Relationship metadata (symmetric per pair)
 RELATIONSHIPS: dict[int, dict[str, dict[str, Any]]] = {}
-DEBUG = True  # Set to False when going global
 REQUEST_CHANNELS: dict[int, int] = {}
 
 

@@ -3,3 +3,4 @@ consent_data.json
 dm_requests.json
 dm_relationships.json
 .env
+accord.db
