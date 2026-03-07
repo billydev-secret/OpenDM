@@ -1,6 +1,27 @@
-dm_audit_log.json
-consent_data.json
-dm_requests.json
-dm_relationships.json
+# Data files
 .env
 accord.db
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# IDEs
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/

@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 import datetime
-import json
 import logging
 import os
+import re
 import sqlite3
 from pathlib import Path
 from typing import Any
@@ -43,7 +43,14 @@ def _get_bool_env(name: str, default: bool) -> bool:
     if raw_value in {None, ""}:
         return default
 
-    return raw_value.strip().lower() in {"1", "true", "yes", "on"}
+    normalized = raw_value.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+
+    log.warning("Invalid boolean for %s=%r, using default %s", name, raw_value, default)
+    return default
 
 
 TOKEN = os.getenv("DISCORD_TOKEN")
@@ -51,11 +58,6 @@ GUILD_ID = _get_int_env("GUILD_ID")
 DEBUG = _get_bool_env("DEBUG", False)
 
 BYPASS_ROLE_IDS = set()
-CONSENT_FILE = Path("consent_data.json")
-DM_REQUESTS_FILE = Path("dm_requests.json")
-RELATIONSHIPS_FILE = Path("dm_relationships.json")
-REQUEST_CHANNEL_FILE = Path("request_channels.json")
-AUDIT_FILE = Path("dm_audit_log.json")
 DB_FILE = Path(os.getenv("ACCORD_DB_FILE", "accord.db"))
 
 # Relationship metadata (symmetric per pair)
@@ -76,20 +78,15 @@ CONSENT_MESSAGES: dict[int, dict[str, dict[str, int]]] = {}
 
 AUDIT_LOG_CHANNEL_ID = None
 AUDIT_LOG_CHANNELS: dict[int, int] = {}
+PANEL_SETTINGS: dict[int, dict[str, int | None]] = {}
+DM_REQUEST_PANEL_VIEW_ID = "dm_request:open_modal"
+DM_REQUEST_PANEL_BUMP_GUARD: dict[int, datetime.datetime] = {}
 
 
 def _connect_db() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_FILE)
     conn.row_factory = sqlite3.Row
     return conn
-
-
-def _load_json_file(path: Path, default: Any) -> Any:
-    try:
-        with path.open("r", encoding="utf-8") as handle:
-            return json.load(handle)
-    except (FileNotFoundError, json.JSONDecodeError, OSError):
-        return default
 
 
 def _get_metadata(conn: sqlite3.Connection, key: str) -> str | None:
@@ -108,20 +105,6 @@ def _set_metadata(conn: sqlite3.Connection, key: str, value: str) -> None:
         """,
         (key, value),
     )
-
-
-def _database_has_state(conn: sqlite3.Connection) -> bool:
-    for table_name in (
-        "consent_pairs",
-        "relationships",
-        "dm_requests",
-        "request_channels",
-        "audit_channels",
-        "audit_log",
-    ):
-        if conn.execute(f"SELECT 1 FROM {table_name} LIMIT 1").fetchone() is not None:
-            return True
-    return False
 
 
 def _iter_unique_pair_rows(pairs_by_guild: dict[int, set[tuple[int, int]]]):
@@ -146,6 +129,7 @@ class Bot(discord.Client):
 
     async def setup_hook(self):
         ensure_database()
+        self.add_view(DmRequestPanelView())
 
         if DEBUG and GUILD_ID is not None:
             guild = discord.Object(id=GUILD_ID)
@@ -173,6 +157,17 @@ async def on_ready():
     reconcile_relationship_defaults()
     load_request_channels()
     load_audit_channels()
+    load_panel_settings()
+
+    # Restore configured DM request panel message on startup.
+    for guild in bot.guilds:
+        settings = PANEL_SETTINGS.get(guild.id)
+        if not isinstance(settings, dict):
+            continue
+        panel_channel_id = settings.get("panel_channel_id")
+        if panel_channel_id is None:
+            continue
+        await ensure_dm_request_panel_message(guild, int(panel_channel_id), force_repost=False)
 
 @bot.event
 async def on_member_update(before: discord.Member, after: discord.Member):
@@ -198,6 +193,12 @@ async def on_disconnect():
     save_relationships()
     save_request_channels()
     save_audit_channels()
+    save_panel_settings()
+
+
+@bot.event
+async def on_message(message):
+    await bump_dm_request_panel_if_needed(message)
 
 # ==============================
 # Logic
@@ -331,6 +332,13 @@ def ensure_database() -> None:
                 channel_id INTEGER NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS confession_settings (
+                guild_id INTEGER PRIMARY KEY,
+                panel_channel_id INTEGER,
+                panel_message_id INTEGER,
+                target_channel_id INTEGER
+            );
+
             CREATE TABLE IF NOT EXISTS audit_log (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 timestamp TEXT NOT NULL,
@@ -342,210 +350,28 @@ def ensure_database() -> None:
                 user2_id INTEGER,
                 request_type TEXT
             );
+
+            -- Performance indexes
+            CREATE INDEX IF NOT EXISTS idx_consent_pairs_guild
+                ON consent_pairs(guild_id);
+
+            CREATE INDEX IF NOT EXISTS idx_relationships_guild_pair
+                ON relationships(guild_id, pair_key);
+
+            CREATE INDEX IF NOT EXISTS idx_dm_requests_guild
+                ON dm_requests(guild_id);
+
+            CREATE INDEX IF NOT EXISTS idx_audit_log_guild
+                ON audit_log(guild_id);
+
+            CREATE INDEX IF NOT EXISTS idx_audit_log_users
+                ON audit_log(guild_id, user1_id, user2_id);
+
+            CREATE INDEX IF NOT EXISTS idx_audit_log_actor
+                ON audit_log(guild_id, actor_id);
             """
         )
 
-        if _get_metadata(conn, "legacy_json_migrated") == "1":
-            return
-
-        if _database_has_state(conn):
-            _set_metadata(conn, "legacy_json_migrated", "1")
-            return
-
-        legacy_consents = _load_json_file(CONSENT_FILE, {})
-        if isinstance(legacy_consents, dict):
-            consent_rows = []
-            for guild_id_str, pairs in legacy_consents.items():
-                try:
-                    guild_id = int(guild_id_str)
-                except (TypeError, ValueError):
-                    continue
-
-                seen: set[tuple[int, int]] = set()
-                for pair in pairs if isinstance(pairs, list) else []:
-                    try:
-                        a, b = map(int, pair)
-                    except (TypeError, ValueError):
-                        continue
-                    if a == b:
-                        continue
-                    lo, hi = (a, b) if a < b else (b, a)
-                    if (lo, hi) in seen:
-                        continue
-                    seen.add((lo, hi))
-                    consent_rows.append((guild_id, lo, hi))
-
-            if consent_rows:
-                conn.executemany(
-                    """
-                    INSERT OR IGNORE INTO consent_pairs(guild_id, user_low, user_high)
-                    VALUES(?, ?, ?)
-                    """,
-                    consent_rows,
-                )
-
-        legacy_relationships = _load_json_file(RELATIONSHIPS_FILE, {})
-        if isinstance(legacy_relationships, dict):
-            relationship_rows = []
-            for guild_id_str, pairs in legacy_relationships.items():
-                try:
-                    guild_id = int(guild_id_str)
-                except (TypeError, ValueError):
-                    continue
-
-                if not isinstance(pairs, dict):
-                    continue
-
-                for pair_key, meta in pairs.items():
-                    if not isinstance(meta, dict):
-                        continue
-                    relationship_rows.append(
-                        (
-                            guild_id,
-                            pair_key,
-                            _normalize_request_type(meta.get("type")),
-                            (meta.get("reason") or "").strip(),
-                            meta.get("created_at"),
-                            None,
-                            None,
-                        )
-                    )
-
-            if relationship_rows:
-                conn.executemany(
-                    """
-                    INSERT OR REPLACE INTO relationships(
-                        guild_id, pair_key, request_type, reason, created_at, source_channel_id, source_message_id
-                    )
-                    VALUES(?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    relationship_rows,
-                )
-
-        legacy_requests = _load_json_file(DM_REQUESTS_FILE, {})
-        if isinstance(legacy_requests, dict):
-            request_rows = []
-            for guild_id_str, pairs in legacy_requests.items():
-                try:
-                    guild_id = int(guild_id_str)
-                except (TypeError, ValueError):
-                    continue
-
-                if not isinstance(pairs, dict):
-                    continue
-
-                for key, value in pairs.items():
-                    try:
-                        requester_id, target_id = map(int, key.split("-"))
-                    except (AttributeError, TypeError, ValueError):
-                        continue
-
-                    if isinstance(value, int):
-                        record = {
-                            "message_id": value,
-                            "request_type": "dm",
-                            "reason": "",
-                            "created_at": None,
-                        }
-                    elif isinstance(value, dict):
-                        record = {
-                            "message_id": int(value.get("message_id") or 0),
-                            "request_type": _normalize_request_type(value.get("request_type") or value.get("type")),
-                            "reason": (value.get("reason") or "").strip(),
-                            "created_at": value.get("created_at"),
-                        }
-                    else:
-                        continue
-
-                    if record["message_id"] <= 0:
-                        continue
-
-                    request_rows.append(
-                        (
-                            guild_id,
-                            requester_id,
-                            target_id,
-                            record["message_id"],
-                            record["request_type"],
-                            record["reason"],
-                            record["created_at"],
-                        )
-                    )
-
-            if request_rows:
-                conn.executemany(
-                    """
-                    INSERT OR REPLACE INTO dm_requests(
-                        guild_id, requester_id, target_id, message_id, request_type, reason, created_at
-                    )
-                    VALUES(?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    request_rows,
-                )
-
-        legacy_request_channels = _load_json_file(REQUEST_CHANNEL_FILE, {})
-        if isinstance(legacy_request_channels, dict):
-            request_channel_rows = []
-            for guild_id_str, channel_id in legacy_request_channels.items():
-                try:
-                    request_channel_rows.append((int(guild_id_str), int(channel_id)))
-                except (TypeError, ValueError):
-                    continue
-
-            if request_channel_rows:
-                conn.executemany(
-                    """
-                    INSERT OR REPLACE INTO request_channels(guild_id, channel_id)
-                    VALUES(?, ?)
-                    """,
-                    request_channel_rows,
-                )
-
-        legacy_audit_entries = _load_json_file(AUDIT_FILE, [])
-        if isinstance(legacy_audit_entries, list):
-            audit_rows = []
-            for entry in legacy_audit_entries:
-                if not isinstance(entry, dict):
-                    continue
-                try:
-                    guild_id = int(entry["guild_id"])
-                except (KeyError, TypeError, ValueError):
-                    continue
-
-                audit_rows.append(
-                    (
-                        entry.get("timestamp") or datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC"),
-                        guild_id,
-                        entry.get("action") or "legacy",
-                        entry.get("message") or "",
-                        None,
-                        None,
-                        None,
-                        entry.get("request_type"),
-                    )
-                )
-
-            if audit_rows:
-                conn.executemany(
-                    """
-                    INSERT INTO audit_log(
-                        timestamp, guild_id, action, message, actor_id, user1_id, user2_id, request_type
-                    )
-                    VALUES(?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    audit_rows,
-                )
-
-        _set_metadata(conn, "legacy_json_migrated", "1")
-
-        if (
-            legacy_consents
-            or legacy_relationships
-            or legacy_requests
-            or legacy_request_channels
-            or legacy_audit_entries
-        ):
-            log.info("Migrated legacy JSON state into %s", DB_FILE)
 
 def load_relationships():
     """Load relationship metadata (symmetric) from SQLite."""
@@ -924,6 +750,478 @@ def save_consent_messages():
     rebuild_consent_messages()
 
 
+def _default_panel_settings() -> dict[str, int | None]:
+    return {
+        "panel_channel_id": None,
+        "panel_message_id": None,
+    }
+
+
+def _get_panel_settings(guild_id: int) -> dict[str, int | None]:
+    current = PANEL_SETTINGS.get(guild_id)
+    if not isinstance(current, dict):
+        current = _default_panel_settings()
+        PANEL_SETTINGS[guild_id] = current
+        return current
+
+    defaults = _default_panel_settings()
+    for key, value in defaults.items():
+        current.setdefault(key, value)
+    return current
+
+
+def load_panel_settings():
+    global PANEL_SETTINGS
+    ensure_database()
+    out: dict[int, dict[str, int | None]] = {}
+
+    with _connect_db() as conn:
+        rows = conn.execute(
+            """
+            SELECT guild_id, panel_channel_id, panel_message_id, target_channel_id
+            FROM confession_settings
+            """
+        ).fetchall()
+
+    for row in rows:
+        guild_id = int(row["guild_id"])
+        out[guild_id] = {
+            "panel_channel_id": int(row["panel_channel_id"]) if row["panel_channel_id"] is not None else None,
+            "panel_message_id": int(row["panel_message_id"]) if row["panel_message_id"] is not None else None,
+        }
+
+    PANEL_SETTINGS = out
+
+
+def save_panel_settings():
+    ensure_database()
+    rows = []
+    for guild_id, settings in PANEL_SETTINGS.items():
+        rows.append(
+            (
+                int(guild_id),
+                settings.get("panel_channel_id"),
+                settings.get("panel_message_id"),
+                None,
+            )
+        )
+
+    with _connect_db() as conn:
+        conn.execute("DELETE FROM confession_settings")
+        if rows:
+            conn.executemany(
+                """
+                INSERT INTO confession_settings(guild_id, panel_channel_id, panel_message_id, target_channel_id)
+                VALUES(?, ?, ?, ?)
+                """,
+                rows,
+            )
+
+
+def _build_dm_request_panel_embed() -> discord.Embed:
+    embed = discord.Embed(
+        title="DM Request Panel",
+        description=(
+            "Click the button below to open a DM request modal.\n"
+            "This uses the same options as `/dm_ask` (user, request type, reason)."
+        ),
+        color=discord.Color.blurple(),
+    )
+    embed.set_footer(text="This panel is kept as the latest message in this channel.")
+    return embed
+
+
+async def ensure_dm_request_panel_message(
+    guild: discord.Guild,
+    panel_channel_id: int,
+    *,
+    force_repost: bool = False,
+) -> int | None:
+    channel = guild.get_channel(panel_channel_id)
+    if channel is None:
+        return None
+
+    settings = _get_panel_settings(guild.id)
+    old_message_id = settings.get("panel_message_id")
+
+    # If panel is already the newest message, just refresh it.
+    if force_repost and old_message_id and hasattr(channel, "history"):
+        try:
+            latest = None
+            async for msg in channel.history(limit=1):
+                latest = msg
+            if latest and int(latest.id) == int(old_message_id):
+                force_repost = False
+        except (discord.Forbidden, discord.HTTPException):
+            pass
+
+    if old_message_id and not force_repost:
+        try:
+            existing = await channel.fetch_message(int(old_message_id))
+            await existing.edit(embed=_build_dm_request_panel_embed(), view=DmRequestPanelView())
+            settings["panel_channel_id"] = int(panel_channel_id)
+            PANEL_SETTINGS[guild.id] = settings
+            save_panel_settings()
+            return int(existing.id)
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            settings["panel_message_id"] = None
+
+    try:
+        new_message = await channel.send(embed=_build_dm_request_panel_embed(), view=DmRequestPanelView())
+    except (discord.Forbidden, discord.HTTPException):
+        return None
+
+    new_message_id = int(new_message.id)
+    settings["panel_channel_id"] = int(panel_channel_id)
+    settings["panel_message_id"] = new_message_id
+    PANEL_SETTINGS[guild.id] = settings
+    save_panel_settings()
+
+    if old_message_id and int(old_message_id) != new_message_id:
+        try:
+            old_message = await channel.fetch_message(int(old_message_id))
+            await old_message.delete()
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException, AttributeError):
+            pass
+
+    return new_message_id
+
+
+async def bump_dm_request_panel_if_needed(message: Any):
+    guild = getattr(message, "guild", None)
+    channel = getattr(message, "channel", None)
+    if guild is None or channel is None:
+        return
+
+    settings = PANEL_SETTINGS.get(guild.id)
+    if not isinstance(settings, dict):
+        return
+
+    panel_channel_id = settings.get("panel_channel_id")
+    panel_message_id = settings.get("panel_message_id")
+    if panel_channel_id is None:
+        return
+    if getattr(channel, "id", None) != panel_channel_id:
+        return
+    if panel_message_id is not None and getattr(message, "id", None) == panel_message_id:
+        return
+
+    # Prevent rapid repost loops.
+    now = datetime.datetime.utcnow()
+    last = DM_REQUEST_PANEL_BUMP_GUARD.get(guild.id)
+    if last and (now - last).total_seconds() < 2:
+        return
+
+    DM_REQUEST_PANEL_BUMP_GUARD[guild.id] = now
+    await ensure_dm_request_panel_message(guild, int(panel_channel_id), force_repost=True)
+
+
+def _resolve_member_from_text(guild: discord.Guild, raw: str) -> discord.Member | None:
+    text = str(raw or "").strip()
+    if not text:
+        return None
+
+    mention_match = re.fullmatch(r"<@!?(\d+)>", text)
+    if mention_match:
+        user_id = int(mention_match.group(1))
+        return guild.get_member(user_id)
+
+    if text.isdigit():
+        return guild.get_member(int(text))
+
+    return None
+
+
+def _precheck_dm_request(
+    guild: discord.Guild,
+    requester: discord.Member,
+    target: discord.Member,
+) -> tuple[str | None, discord.TextChannel | None]:
+    if target.id == requester.id and not DEBUG:
+        return "You cannot request permission with yourself.", None
+
+    if target.bot:
+        return "You cannot request permission from bots.", None
+
+    mode = resolve_mode(target)
+    if mode == "closed":
+        return f"{target.display_name} has DMs set to CLOSED and is not accepting requests.", None
+
+    if mode == "open" and not DEBUG:
+        return f"{target.display_name} has DMs set to OPEN. No request required.", None
+
+    if is_mutual(guild.id, requester.id, target.id):
+        return "A permission relationship already exists.", None
+
+    request_channel_id = REQUEST_CHANNELS.get(guild.id)
+    if not request_channel_id:
+        return "No DM request channel has been configured. Use `/dm_request_channel_set` first.", None
+
+    request_channel = guild.get_channel(request_channel_id)
+    if not request_channel:
+        return "Configured DM request channel is invalid.", None
+
+    return None, request_channel
+
+
+async def _submit_dm_request(
+    interaction: discord.Interaction,
+    user: discord.Member,
+    request_type: str | None,
+    reason: str | None,
+):
+    guild = interaction.guild
+    guild_id = guild.id
+    requester = interaction.user
+
+    req_type = _normalize_request_type(request_type or "dm")
+    reason_clean = str(reason or "").strip()
+    if len(reason_clean) > 256:
+        reason_clean = reason_clean[:253] + "..."
+
+    error_message, request_channel = _precheck_dm_request(guild, requester, user)
+    if error_message:
+        await interaction.response.send_message(error_message, ephemeral=True)
+        return
+
+    # Defensive fallback (precheck should always resolve this).
+    if request_channel is None:
+        await interaction.response.send_message(
+            "Configured DM request channel is invalid.",
+            ephemeral=True
+        )
+        return
+
+    embed = discord.Embed(
+        title="📨 Permission Request",
+        description=(
+            f"{user.mention}\n\n"
+            f"You have a connection request.\n\n"
+            "This request will time out in 24 hours."
+        ),
+        color=discord.Color.gold()
+    )
+
+    embed.set_author(
+        name=interaction.user.display_name,
+        icon_url=interaction.user.display_avatar.url
+    )
+
+    embed.set_footer(text="Permission can be revoked at any time with /dm_revoke")
+
+    embed.add_field(
+        name="Request Type",
+        value=_request_type_label(req_type),
+        inline=True
+    )
+    embed.add_field(
+        name="Reason",
+        value=reason_clean if reason_clean else "—",
+        inline=False
+    )
+
+    view = AskConsentView(
+        requester_id=requester.id,
+        target_id=user.id,
+        guild_id=guild_id,
+        request_type=req_type,
+        reason=reason_clean
+    )
+
+    try:
+        message = await request_channel.send(
+            content=user.mention,
+            embed=embed,
+            view=view,
+            allowed_mentions=discord.AllowedMentions(users=[user])
+        )
+
+        await message.edit(content=None)
+        view.message = message
+
+        DM_REQUESTS.setdefault(guild_id, {})
+        DM_REQUESTS[guild_id][(requester.id, user.id)] = {
+            "message_id": message.id,
+            "request_type": req_type,
+            "reason": reason_clean,
+            "created_at": datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+        }
+        save_dm_requests()
+
+    except discord.Forbidden:
+        await interaction.response.send_message(
+            "I do not have permission to send messages in the configured DM request channel.",
+            ephemeral=True
+        )
+        return
+
+    await log_audit_event(
+        interaction.guild,
+        f"DM request asked: {interaction.user.display_name} ➝ {user.display_name} ({_request_type_label(req_type)})"
+    )
+
+    await interaction.response.send_message(
+        f"📨 DM request sent to {request_channel.mention}.",
+        ephemeral=True
+    )
+
+
+def _build_picker_prompt(selected_user_id: int | None, request_type: str) -> str:
+    user_line = f"<@{selected_user_id}>" if selected_user_id is not None else "No user selected yet."
+    type_line = _request_type_label(request_type)
+    return (
+        "**DM Request Builder**\n"
+        f"User: {user_line}\n"
+        f"Request Type: {type_line}\n\n"
+        "Pick a user from the list, choose a request type, then press Continue."
+    )
+
+
+class DmRequestReasonModal(discord.ui.Modal):
+    def __init__(self, target_user_id: int, request_type: str):
+        super().__init__(title="Send DM Request")
+        self.target_user_id = target_user_id
+        self.request_type = _normalize_request_type(request_type)
+        self.reason_input = discord.ui.TextInput(
+            label="Reason (optional)",
+            style=discord.TextStyle.paragraph,
+            required=False,
+            max_length=256,
+            placeholder="Optional context shown to recipient",
+        )
+        self.add_item(self.reason_input)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        guild = interaction.guild
+        if guild is None:
+            await interaction.response.send_message(
+                "This modal can only be used in a server.",
+                ephemeral=True,
+            )
+            return
+
+        target_user = guild.get_member(self.target_user_id)
+        if target_user is None:
+            await interaction.response.send_message(
+                "Could not resolve that user in this server.",
+                ephemeral=True,
+            )
+            return
+
+        await _submit_dm_request(
+            interaction,
+            target_user,
+            self.request_type,
+            str(self.reason_input.value or ""),
+        )
+
+
+class DmRequestUserSelect(discord.ui.UserSelect):
+    def __init__(self):
+        super().__init__(
+            placeholder="Select a user...",
+            min_values=1,
+            max_values=1,
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        view = self.view
+        if not isinstance(view, DmRequestLookupView):
+            return
+
+        selected = self.values[0]
+        view.selected_user_id = selected.id
+        await interaction.response.edit_message(
+            content=_build_picker_prompt(view.selected_user_id, view.request_type),
+            view=view,
+        )
+
+
+class DmRequestLookupView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=300)
+        self.selected_user_id: int | None = None
+        self.request_type: str = "dm"
+        self.add_item(DmRequestUserSelect())
+
+    @discord.ui.button(label="Type: DM", style=discord.ButtonStyle.secondary)
+    async def pick_dm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.request_type = "dm"
+        await interaction.response.edit_message(
+            content=_build_picker_prompt(self.selected_user_id, self.request_type),
+            view=self,
+        )
+
+    @discord.ui.button(label="Type: Friend", style=discord.ButtonStyle.secondary)
+    async def pick_friend(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.request_type = "friend"
+        await interaction.response.edit_message(
+            content=_build_picker_prompt(self.selected_user_id, self.request_type),
+            view=self,
+        )
+
+    @discord.ui.button(label="Continue", style=discord.ButtonStyle.primary)
+    async def continue_to_reason(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if self.selected_user_id is None:
+            await interaction.response.send_message(
+                "Pick a user first.",
+                ephemeral=True,
+            )
+            return
+
+        guild = interaction.guild
+        if guild is None:
+            await interaction.response.send_message(
+                "This control can only be used in a server channel.",
+                ephemeral=True,
+            )
+            return
+
+        target_user = guild.get_member(self.selected_user_id)
+        if target_user is None:
+            await interaction.response.send_message(
+                "Could not resolve that user in this server.",
+                ephemeral=True,
+            )
+            return
+
+        error_message, _ = _precheck_dm_request(guild, interaction.user, target_user)
+        if error_message:
+            await interaction.response.send_message(error_message, ephemeral=True)
+            return
+
+        await interaction.response.send_modal(
+            DmRequestReasonModal(
+                target_user_id=self.selected_user_id,
+                request_type=self.request_type,
+            )
+        )
+
+
+class DmRequestPanelView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(
+        label="Open DM Request Form",
+        style=discord.ButtonStyle.primary,
+        custom_id=DM_REQUEST_PANEL_VIEW_ID,
+    )
+    async def open_modal(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.guild is None:
+            await interaction.response.send_message(
+                "This button can only be used in a server channel.",
+                ephemeral=True,
+            )
+            return
+        picker_view = DmRequestLookupView()
+        await interaction.response.send_message(
+            _build_picker_prompt(None, "dm"),
+            view=picker_view,
+            ephemeral=True,
+        )
+
+
 class AskConsentView(discord.ui.View):
     def __init__(
         self,
@@ -1104,7 +1402,7 @@ class AskConsentView(discord.ui.View):
 # ==============================
 @bot.tree.command(
     name="dm_help",
-    description="Learn how DM request permissions work"
+    description="Show an overview of the DM request system"
 )
 async def dm_help(interaction: discord.Interaction):
 
@@ -1158,9 +1456,13 @@ async def dm_help(interaction: discord.Interaction):
     embed.add_field(
         name="Moderator Tools",
         value=(
-            "`/dm_permissions_set` — Manually create relationship\n"
-            "`/dm_permissions_remove` — Remove relationship\n"
-            "`/dm_permissions_list` — View all stored relationships"
+            "`/debug_permissions_set` — Manually create relationship\n"
+            "`/debug_permissions_remove` — Remove relationship\n"
+            "`/debug_permissions_list` — View all stored relationships\n"
+            "`/dm_set_audit_channel` — Configure audit log channel\n"
+            "`/dm_audit_user` — View per-user audit history\n"
+            "`/dm_request_panel_set` — Set DM request panel channel\n"
+            "`/dm_request_panel_refresh` — Repost DM request panel"
         ),
         inline=False
     )
@@ -1174,7 +1476,7 @@ async def dm_help(interaction: discord.Interaction):
 
 @bot.tree.command(
     name="dm_info",
-    description="View your DM mode and all stored DM permissions"
+    description="Show your DM mode and current permission relationships"
 )
 async def dm_info(interaction: discord.Interaction):
 
@@ -1294,9 +1596,9 @@ async def dm_info(interaction: discord.Interaction):
 
 @bot.tree.command(
     name="dm_set_mode",
-    description="Set your DM request preference"
+    description="Set your DM request mode (open, ask, or closed)"
 )
-@app_commands.describe(mode="open, ask, or closed")
+@app_commands.describe(mode="Choose your DM mode")
 @app_commands.choices(
     mode=[
         app_commands.Choice(name="open", value="open"),
@@ -1366,9 +1668,9 @@ async def dm_set_mode(interaction: discord.Interaction, mode: app_commands.Choic
 
 @bot.tree.command(
     name="dm_allow",
-    description="Mutually allow mentions with another user"
+    description="Create a mutual DM permission relationship with a user"
 )
-@app_commands.describe(user="User to allow")
+@app_commands.describe(user="User to grant mutual permission with")
 async def dm_allow(interaction: discord.Interaction, user: discord.Member):
 
     guild_id = interaction.guild.id
@@ -1391,9 +1693,9 @@ async def dm_allow(interaction: discord.Interaction, user: discord.Member):
 
 @bot.tree.command(
     name="dm_revoke",
-    description="Revoke DM consent with another user"
+    description="Remove DM permission relationship with another user"
 )
-@app_commands.describe(user="User to revoke consent with")
+@app_commands.describe(user="User to revoke permission with")
 async def dm_revoke(interaction: discord.Interaction, user: discord.Member):
 
     guild_id = interaction.guild.id
@@ -1495,31 +1797,13 @@ async def dm_revoke(interaction: discord.Interaction, user: discord.Member):
     await interaction.response.send_message(
         f"DM consent revoked with {user.mention}."
     )
-    return
-
-    await log_audit_event(
-        interaction.guild,
-        f"DM permission revoked: {interaction.user.id} ↔ {user.display_name} (by {interaction.user.display_name})"
-    )
-
-    if removed:
-        save_consent()
-
-        await interaction.response.send_message(
-            f"DM consent revoked with {user.mention}."
-        )
-    else:
-        await interaction.response.send_message(
-            "No mutual consent existed.",
-            ephemeral=True
-        )
 
 
 @bot.tree.command(
     name="dm_status",
-    description="Check DM consent status with a user"
+    description="Check whether mutual DM permission exists with a user"
 )
-@app_commands.describe(user="User to check status with")
+@app_commands.describe(user="User to check permission status with")
 async def dm_status(interaction: discord.Interaction, user: discord.Member):
 
     guild_id = interaction.guild.id
@@ -1547,12 +1831,12 @@ async def dm_status(interaction: discord.Interaction, user: discord.Member):
 
 @bot.tree.command(
     name="dm_ask",
-    description="Request DM permission with a user"
+    description="Send a DM permission request to a user"
 )
 @app_commands.describe(
-    user="User to request permission from",
-    request_type="Choose whether you're requesting a DM or a friend request",
-    reason="Optional reason/context that will be shown to the recipient"
+    user="User you want to contact",
+    request_type="Choose DM or friend request",
+    reason="Optional context shown to the recipient"
 )
 @app_commands.choices(
     request_type=[
@@ -1566,168 +1850,18 @@ async def dm_ask(
     request_type: app_commands.Choice[str] | None = None,
     reason: str | None = None
 ):
-    guild = interaction.guild
-    guild_id = guild.id
-    requester = interaction.user
-
-    req_type = _normalize_request_type(request_type.value if request_type else "dm")
-    reason_clean = str(reason or "").strip()
-    if len(reason_clean) > 256:
-        reason_clean = reason_clean[:253] + "..."
-
-    log.info(f"dm_ask triggered {discord.Member}\n")
-
-    # ❌ Self check
-    if user.id == requester.id and not DEBUG:
-        await interaction.response.send_message(
-            "You cannot request permission with yourself.",
-            ephemeral=True
-        )
-        return
-
-    # ❌ Bot check
-    if user.bot:
-        await interaction.response.send_message(
-            "You cannot request permission from bots.",
-            ephemeral=True
-        )
-        return
-
-    # ❌ Respect CLOSED mode
-    mode = resolve_mode(user)
-
-    if mode == "closed":
-        await interaction.response.send_message(
-            f"{user.display_name} has DMs set to CLOSED and is not accepting requests.",
-            ephemeral=True
-        )
-        return
-
-    # ✅ OPEN shortcut
-    if mode == "open" and not DEBUG:
-        await interaction.response.send_message(
-            f"{user.display_name} has DMs set to OPEN. No request required.",
-            ephemeral=True
-        )
-        return
-
-    # ❌ Existing relationship
-    if is_mutual(guild_id, requester.id, user.id):
-        await interaction.response.send_message(
-            "A permission relationship already exists.",
-            ephemeral=True
-        )
-        return
-
-    # -------------------------------
-    # Determine Request Channel
-    # -------------------------------
-    request_channel_id = REQUEST_CHANNELS.get(guild_id)
-
-    if not request_channel_id:
-        await interaction.response.send_message(
-            "No DM request channel has been configured. Use `/dm_request_channel_set` first.",
-            ephemeral=True
-        )
-        return
-
-    request_channel = guild.get_channel(request_channel_id)
-
-    if not request_channel:
-        await interaction.response.send_message(
-            "Configured DM request channel is invalid.",
-            ephemeral=True
-        )
-        return
-
-    # -------------------------------
-    # Create Embed
-    # -------------------------------
-    embed = discord.Embed(
-        title="📨 Permission Request",
-        description=(
-            f"{user.mention}\n\n"
-            f"You have a connection request.\n\n"
-            "This request will time out in 24 hours."
-        ),
-        color=discord.Color.gold()
-    )
-
-    embed.set_author(
-        name=interaction.user.display_name,
-        icon_url=interaction.user.display_avatar.url
-    )
-
-    embed.set_footer(text="Permission can be revoked at any time with /dm_revoke")
-
-    embed.add_field(
-        name="Request Type",
-        value=_request_type_label(req_type),
-        inline=True
-    )
-    embed.add_field(
-        name="Reason",
-        value=reason_clean if reason_clean else "—",
-        inline=False
-    )
-
-    # -------------------------------
-    # Create View
-    # -------------------------------
-    view = AskConsentView(
-        requester_id=requester.id,
-        target_id=user.id,
-        guild_id=guild_id,
-        request_type=req_type,
-        reason=reason_clean
-    )
-
-    # -------------------------------
-    # Send to Request Channel
-    # -------------------------------
-    try:
-        message = await request_channel.send(
-            content=user.mention,
-            embed=embed,
-            view=view,
-            allowed_mentions=discord.AllowedMentions(users=[user])
-        )
-
-        await message.edit(content=None)
-
-        view.message = message
-
-        DM_REQUESTS.setdefault(guild_id, {})
-        DM_REQUESTS[guild_id][(requester.id, user.id)] = {
-            "message_id": message.id,
-            "request_type": req_type,
-            "reason": reason_clean,
-            "created_at": datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
-        }
-        save_dm_requests()
-
-    except discord.Forbidden:
-        await interaction.response.send_message(
-            "I do not have permission to send messages in the configured DM request channel.",
-            ephemeral=True
-        )
-        return
-
-    await log_audit_event(
-        interaction.guild,
-        f"DM request asked: {interaction.user.display_name} ➝ {user.display_name} ({_request_type_label(req_type)})"
-    )
-
-    await interaction.response.send_message(
-        f"📨 DM request sent to {request_channel.mention}.",
-        ephemeral=True
+    await _submit_dm_request(
+        interaction,
+        user,
+        request_type.value if request_type else "dm",
+        reason,
     )
 
 
 
 @bot.tree.command(
     name="dm_request_channel_set",
-    description="Set the channel where DM requests will be posted"
+    description="Set the channel where DM requests are posted"
 )
 @app_commands.describe(channel="Channel to send DM requests to")
 async def dm_request_channel_set(
@@ -1751,8 +1885,82 @@ async def dm_request_channel_set(
 
 
 @bot.tree.command(
+    name="dm_request_panel_set",
+    description="Set the channel that holds the DM request button panel"
+)
+@app_commands.describe(channel="Channel where the DM request button should stay at the bottom")
+async def dm_request_panel_set(interaction: discord.Interaction, channel: discord.TextChannel):
+    if not interaction.user.guild_permissions.manage_channels:
+        await interaction.response.send_message(
+            "You do not have permission to configure the DM request panel.",
+            ephemeral=True,
+        )
+        return
+
+    settings = _get_panel_settings(interaction.guild.id)
+    settings["panel_channel_id"] = channel.id
+    PANEL_SETTINGS[interaction.guild.id] = settings
+    save_panel_settings()
+
+    message_id = await ensure_dm_request_panel_message(interaction.guild, channel.id, force_repost=True)
+    if message_id is None:
+        await interaction.response.send_message(
+            "I could not post the DM request panel there. Check channel permissions.",
+            ephemeral=True,
+        )
+        return
+
+    await interaction.response.send_message(
+        f"✅ DM request panel set in {channel.mention}.",
+        ephemeral=True,
+    )
+
+    await log_audit_event(
+        interaction.guild,
+        f"DM request panel configured in {channel.mention} by {interaction.user.display_name}",
+        action="dm_request_panel_set",
+        actor_id=interaction.user.id,
+    )
+
+
+@bot.tree.command(
+    name="dm_request_panel_refresh",
+    description="Repost the DM request panel so it is the newest message"
+)
+async def dm_request_panel_refresh(interaction: discord.Interaction):
+    if not interaction.user.guild_permissions.manage_channels:
+        await interaction.response.send_message(
+            "You do not have permission to refresh the DM request panel.",
+            ephemeral=True,
+        )
+        return
+
+    settings = _get_panel_settings(interaction.guild.id)
+    panel_channel_id = settings.get("panel_channel_id")
+    if panel_channel_id is None:
+        await interaction.response.send_message(
+            "No DM request panel is configured. Use `/dm_request_panel_set` first.",
+            ephemeral=True,
+        )
+        return
+
+    message_id = await ensure_dm_request_panel_message(interaction.guild, int(panel_channel_id), force_repost=True)
+    if message_id is None:
+        await interaction.response.send_message(
+            "I could not refresh the DM request panel in the configured channel.",
+            ephemeral=True,
+        )
+        return
+
+    await interaction.response.send_message(
+        "✅ DM request panel refreshed.",
+        ephemeral=True,
+    )
+
+
+@bot.tree.command(
     name="debug_status_check",
-    description="Check your current DM interaction status"
+    description="Show your current DM mode (debug)"
 )
 async def debug_status_check(interaction: discord.Interaction):
 
@@ -1783,7 +1991,7 @@ async def debug_status_check(interaction: discord.Interaction):
 
 @bot.tree.command(
     name="debug_permissions_list",
-    description="List all stored DM permission permissions"
+    description="List all stored DM permission relationships (debug)"
 )
 async def debug_permissions_list(interaction: discord.Interaction):
 
@@ -1828,7 +2036,7 @@ async def debug_permissions_list(interaction: discord.Interaction):
 
 @bot.tree.command(
     name="debug_permissions_set",
-    description="Manually set DM permission permission between two users"
+    description="Manually create DM permission between two users (debug)"
 )
 @app_commands.describe(
     user1="First user",
@@ -1882,7 +2090,7 @@ async def debug_permissions_set(
 
 @bot.tree.command(
     name="debug_permissions_remove",
-    description="Remove DM permission permission between two users"
+    description="Manually remove DM permission between two users (debug)"
 )
 @app_commands.describe(
     user1="First user",
@@ -1949,7 +2157,7 @@ async def debug_permissions_remove(
 
 @bot.tree.command(
     name="dm_set_audit_channel",
-    description="Set channel for DM permission audit logs"
+    description="Set the channel used for DM permission audit logs"
 )
 @app_commands.describe(channel="Channel to send audit logs to")
 async def dm_set_audit_channel(interaction: discord.Interaction, channel: discord.TextChannel):
@@ -1972,7 +2180,7 @@ async def dm_set_audit_channel(interaction: discord.Interaction, channel: discor
 
 @bot.tree.command(
     name="dm_audit_user",
-    description="View DM permission audit history for a user"
+    description="Show DM permission audit history for a user"
 )
 @app_commands.describe(
     user="User to inspect",

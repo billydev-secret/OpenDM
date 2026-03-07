@@ -81,6 +81,9 @@ def test_command_registration_includes_all_slash_commands(accord_module):
         "debug_permissions_set",
         "debug_permissions_remove",
         "dm_set_audit_channel",
+        "dm_audit_user",
+        "dm_request_panel_set",
+        "dm_request_panel_refresh",
     }
     assert expected.issubset(command_names)
 
@@ -194,6 +197,30 @@ def test_dm_request_channel_set_updates_channel_when_permitted(accord_module, mo
 
     assert accord_module.REQUEST_CHANNELS[999] == 77
     assert "#requests" in get_sent_text(interaction.response.send_message)
+
+
+def test_dm_request_panel_set_updates_channel_when_permitted(accord_module, monkeypatch):
+    monkeypatch.setattr(accord_module, "save_panel_settings", lambda: None)
+
+    async def _fake_ensure(guild, panel_channel_id, force_repost=False):
+        return 12345
+
+    monkeypatch.setattr(accord_module, "ensure_dm_request_panel_message", _fake_ensure)
+    monkeypatch.setattr(accord_module, "log_audit_event", AsyncMock())
+
+    requester = make_member(
+        member_id=1,
+        perms=SimpleNamespace(manage_channels=True, manage_roles=False, manage_guild=False),
+    )
+    guild = make_guild(guild_id=999)
+    interaction = make_interaction(guild, requester)
+    channel = SimpleNamespace(id=88, mention="#dm-request-panel")
+
+    run(accord_module.dm_request_panel_set(interaction, channel))
+
+    settings = accord_module.PANEL_SETTINGS[999]
+    assert settings["panel_channel_id"] == 88
+    assert "#dm-request-panel" in get_sent_text(interaction.response.send_message)
 
 
 def test_debug_status_check_reports_open_state(accord_module):

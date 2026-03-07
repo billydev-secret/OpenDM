@@ -81,6 +81,7 @@ def _install_fake_discord():
         def __init__(self, intents=None):
             self.intents = intents
             self.user = SimpleNamespace(id=1)
+            self.guilds = []
 
         def event(self, func):
             return func
@@ -88,18 +89,63 @@ def _install_fake_discord():
         def run(self, token):
             return None
 
+        def add_view(self, view):
+            return None
+
     class View:
         def __init__(self, timeout=None):
             self.timeout = timeout
             self.children = []
 
-    def button(label=None, style=None):
+        def add_item(self, item):
+            self.children.append(item)
+            setattr(item, "view", self)
+
+    class UserSelect:
+        def __init__(self, placeholder=None, min_values=1, max_values=1):
+            self.placeholder = placeholder
+            self.min_values = min_values
+            self.max_values = max_values
+            self.values = []
+            self.view = None
+
+    class Modal:
+        def __init__(self, *, title=None):
+            self.title = title
+            self.children = []
+
+        def add_item(self, item):
+            self.children.append(item)
+
+    class TextInput:
+        def __init__(
+            self,
+            *,
+            label=None,
+            required=True,
+            max_length=None,
+            placeholder=None,
+            style=None,
+        ):
+            self.label = label
+            self.required = required
+            self.max_length = max_length
+            self.placeholder = placeholder
+            self.style = style
+            self.value = ""
+
+    class TextStyle:
+        paragraph = 2
+
+    def button(label=None, style=None, custom_id=None):
         def decorator(func):
             return func
 
         return decorator
 
     class ButtonStyle:
+        primary = 0
+        secondary = 3
         success = 1
         danger = 2
 
@@ -117,8 +163,16 @@ def _install_fake_discord():
     discord_mod.Embed = Embed
     discord_mod.Color = Color
     discord_mod.Client = Client
+    discord_mod.TextStyle = TextStyle
     discord_mod.utils = SimpleNamespace(get=utils_get)
-    discord_mod.ui = SimpleNamespace(View=View, button=button, Button=object)
+    discord_mod.ui = SimpleNamespace(
+        View=View,
+        Modal=Modal,
+        TextInput=TextInput,
+        UserSelect=UserSelect,
+        button=button,
+        Button=object,
+    )
     discord_mod.ButtonStyle = ButtonStyle
 
     # type placeholders used only in annotations
@@ -194,4 +248,5 @@ def accord_module():
     module.INTERACTION_PAIRS = {}
     module.REQUEST_CHANNELS = {}
     module.AUDIT_LOG_CHANNEL_ID = None
+    module.PANEL_SETTINGS = {}
     return module
