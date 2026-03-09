@@ -81,7 +81,6 @@ async def _submit_dm_request(interaction, user, request_type, reason):
         title="📨 Someone wants to connect with you",
         description=(
             f"{user.mention}\n\n"
-            f"**{interaction.user.display_name}** would like to reach out to you.\n\n"
             "This request expires in 24 hours."
         ),
         color=discord.Color.gold(),

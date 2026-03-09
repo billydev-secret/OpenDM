@@ -71,6 +71,13 @@ bot = Bot()
 @bot.event
 async def on_ready():
     log.info(f"Logged in as {bot.user} (ID: {bot.user.id})")
+
+    if not DEBUG:
+        for guild in bot.guilds:
+            bot.tree.clear_commands(guild=guild)
+            await bot.tree.sync(guild=guild)
+        log.info("Cleared guild-specific commands for %d guild(s).", len(bot.guilds))
+
     load_consent()
     load_dm_requests()
     load_relationships()
