@@ -8,12 +8,11 @@ from ..constants import DM_REQUEST_PANEL_VIEW_ID
 from ..services.permissions import normalize_request_type, request_type_label
 
 
-def _build_picker_prompt(selected_user_id: int | None, request_type: str) -> str:
+def _build_picker_prompt(selected_user_id: int | None) -> str:
     user_line = f"<@{selected_user_id}>" if selected_user_id is not None else "nobody yet"
     return (
         "**Who do you want to reach out to?**\n"
-        f"Selected: {user_line}\n"
-        f"Type: {request_type_label(request_type)}\n\n"
+        f"Selected: {user_line}\n\n"
         "Pick someone from the list, choose what kind of request it is, then hit Continue."
     )
 
@@ -61,7 +60,7 @@ class DmRequestUserSelect(discord.ui.UserSelect):
             return
         view.selected_user_id = self.values[0].id
         await interaction.response.edit_message(
-            content=_build_picker_prompt(view.selected_user_id, view.request_type),
+            content=_build_picker_prompt(view.selected_user_id),
             view=view,
         )
 
@@ -147,7 +146,7 @@ class DmRequestPanelView(discord.ui.View):
             submit_fn=self._submit_fn,
         )
         await interaction.response.send_message(
-            _build_picker_prompt(None, "dm"),
+            _build_picker_prompt(None),
             view=picker_view,
             ephemeral=True,
         )
