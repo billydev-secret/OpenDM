@@ -202,7 +202,7 @@ def test_dm_request_channel_set_updates_channel_when_permitted(accord_module, mo
 def test_dm_request_panel_set_updates_channel_when_permitted(accord_module, monkeypatch):
     monkeypatch.setattr(accord_module, "save_panel_settings", lambda: None)
 
-    async def _fake_ensure(guild, panel_channel_id, force_repost=False):
+    async def _fake_ensure(guild, panel_channel_id, force_repost=False, **kwargs):
         return 12345
 
     monkeypatch.setattr(accord_module, "ensure_dm_request_panel_message", _fake_ensure)

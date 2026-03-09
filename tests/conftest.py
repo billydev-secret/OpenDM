@@ -25,6 +25,9 @@ def _install_fake_discord():
     class NotFound(Exception):
         pass
 
+    class HTTPException(Exception):
+        pass
+
     class Intents:
         @staticmethod
         def default():
@@ -158,6 +161,7 @@ def _install_fake_discord():
 
     discord_mod.Forbidden = Forbidden
     discord_mod.NotFound = NotFound
+    discord_mod.HTTPException = HTTPException
     discord_mod.Intents = Intents
     discord_mod.Object = Object
     discord_mod.Embed = Embed
@@ -191,6 +195,12 @@ def _install_fake_discord():
         async def sync(self, guild=None):
             return None
 
+        def clear_commands(self, guild=None):
+            self._commands = []
+
+        def copy_global_to(self, guild=None):
+            pass
+
         def command(self, name, description, guild=None):
             def decorator(func):
                 self._commands.append(
@@ -212,6 +222,10 @@ def _install_fake_discord():
         def __class_getitem__(cls, item):
             return cls
 
+    class Range:
+        def __class_getitem__(cls, item):
+            return cls
+
     def describe(**kwargs):
         def decorator(func):
             return func
@@ -226,6 +240,7 @@ def _install_fake_discord():
 
     app_commands_mod.CommandTree = CommandTree
     app_commands_mod.Choice = Choice
+    app_commands_mod.Range = Range()
     app_commands_mod.describe = describe
     app_commands_mod.choices = choices
 
@@ -240,13 +255,36 @@ def accord_module():
     _install_fake_dotenv()
     _install_fake_discord()
 
-    if "accord" in sys.modules:
-        module = importlib.reload(sys.modules["accord"])
-    else:
-        module = importlib.import_module("accord")
+    # Reload command modules so each test starts with fresh module-level bindings
+    import accord_bot.commands.dm as _dm
+    _dm = importlib.reload(_dm)
 
-    module.INTERACTION_PAIRS = {}
-    module.REQUEST_CHANNELS = {}
-    module.AUDIT_LOG_CHANNEL_ID = None
-    module.PANEL_SETTINGS = {}
-    return module
+    import accord_bot.commands.debug as _debug
+    _debug = importlib.reload(_debug)
+
+    # Reload bot module to get a fresh Bot instance with an empty command tree
+    import accord_bot.bot as _bot_mod
+    _bot_mod = importlib.reload(_bot_mod)
+
+    # Register all commands on the fresh bot
+    _dm.setup(_bot_mod.bot)
+    _debug.setup(_bot_mod.bot)
+
+    # Expose bot on the dm module (used by test_command_registration_includes_all_slash_commands)
+    _dm.bot = _bot_mod.bot
+
+    # Expose debug command functions on the dm module for unified accord_module access
+    _dm.debug_status_check = _debug.debug_status_check
+    _dm.debug_permissions_list = _debug.debug_permissions_list
+    _dm.debug_permissions_set = _debug.debug_permissions_set
+    _dm.debug_permissions_remove = _debug.debug_permissions_remove
+
+    # Reset all mutable state that commands look up in this module's namespace
+    _dm.INTERACTION_PAIRS = {}
+    _dm.CONSENT_MESSAGES = {}
+    _dm.DM_REQUESTS = {}
+    _dm.REQUEST_CHANNELS = {}
+    _dm.PANEL_SETTINGS = {}
+    _dm.AUDIT_LOG_CHANNEL_ID = None
+
+    return _dm
