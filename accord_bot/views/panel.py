@@ -9,12 +9,12 @@ from ..services.permissions import normalize_request_type, request_type_label
 
 
 def _build_picker_prompt(selected_user_id: int | None, request_type: str) -> str:
-    user_line = f"<@{selected_user_id}>" if selected_user_id is not None else "No user selected yet."
+    user_line = f"<@{selected_user_id}>" if selected_user_id is not None else "nobody yet"
     return (
-        "**DM Request Builder**\n"
-        f"User: {user_line}\n"
-        f"Request Type: {request_type_label(request_type)}\n\n"
-        "Pick a user from the list, choose a request type, then press Continue."
+        "**Who do you want to reach out to?**\n"
+        f"Selected: {user_line}\n"
+        f"Type: {request_type_label(request_type)}\n\n"
+        "Pick someone from the list, choose what kind of request it is, then hit Continue."
     )
 
 
@@ -25,11 +25,11 @@ class DmRequestReasonModal(discord.ui.Modal):
         self.request_type = normalize_request_type(request_type)
         self._submit_fn = submit_fn
         self.reason_input = discord.ui.TextInput(
-            label="Reason (optional)",
+            label="Want to add a reason? (optional)",
             style=discord.TextStyle.paragraph,
             required=False,
             max_length=256,
-            placeholder="Optional context shown to recipient",
+            placeholder="Give them a heads up — why do you want to connect?",
         )
         self.add_item(self.reason_input)
 
@@ -37,13 +37,13 @@ class DmRequestReasonModal(discord.ui.Modal):
         guild = interaction.guild
         if guild is None:
             await interaction.response.send_message(
-                "This modal can only be used in a server.", ephemeral=True
+                "This only works inside a server, not in DMs.", ephemeral=True
             )
             return
         target_user = guild.get_member(self.target_user_id)
         if target_user is None:
             await interaction.response.send_message(
-                "Could not resolve that user in this server.", ephemeral=True
+                "Hmm, couldn't find that person in this server.", ephemeral=True
             )
             return
         await self._submit_fn(
@@ -75,9 +75,14 @@ class DmRequestLookupView(discord.ui.View):
         self._submit_fn = submit_fn
         self.add_item(DmRequestUserSelect())
 
-    @discord.ui.button(label="Type: DM", style=discord.ButtonStyle.secondary)
+    def _sync_type_buttons(self):
+        self.pick_dm.style = discord.ButtonStyle.primary if self.request_type == "dm" else discord.ButtonStyle.secondary
+        self.pick_friend.style = discord.ButtonStyle.primary if self.request_type == "friend" else discord.ButtonStyle.secondary
+
+    @discord.ui.button(label="Type: DM", style=discord.ButtonStyle.primary)
     async def pick_dm(self, interaction: discord.Interaction, button: discord.ui.Button):
         self.request_type = "dm"
+        self._sync_type_buttons()
         await interaction.response.edit_message(
             content=_build_picker_prompt(self.selected_user_id, self.request_type), view=self
         )
@@ -85,6 +90,7 @@ class DmRequestLookupView(discord.ui.View):
     @discord.ui.button(label="Type: Friend", style=discord.ButtonStyle.secondary)
     async def pick_friend(self, interaction: discord.Interaction, button: discord.ui.Button):
         self.request_type = "friend"
+        self._sync_type_buttons()
         await interaction.response.edit_message(
             content=_build_picker_prompt(self.selected_user_id, self.request_type), view=self
         )
@@ -92,18 +98,18 @@ class DmRequestLookupView(discord.ui.View):
     @discord.ui.button(label="Continue", style=discord.ButtonStyle.primary)
     async def continue_to_reason(self, interaction: discord.Interaction, button: discord.ui.Button):
         if self.selected_user_id is None:
-            await interaction.response.send_message("Pick a user first.", ephemeral=True)
+            await interaction.response.send_message("You haven't picked anyone yet!", ephemeral=True)
             return
         guild = interaction.guild
         if guild is None:
             await interaction.response.send_message(
-                "This control can only be used in a server channel.", ephemeral=True
+                "This only works inside a server, not in DMs.", ephemeral=True
             )
             return
         target_user = guild.get_member(self.selected_user_id)
         if target_user is None:
             await interaction.response.send_message(
-                "Could not resolve that user in this server.", ephemeral=True
+                "Hmm, couldn't find that person in this server.", ephemeral=True
             )
             return
         error_message, _ = self._precheck_fn(guild, interaction.user, target_user)
@@ -133,7 +139,7 @@ class DmRequestPanelView(discord.ui.View):
     async def open_modal(self, interaction: discord.Interaction, button: discord.ui.Button):
         if interaction.guild is None:
             await interaction.response.send_message(
-                "This button can only be used in a server channel.", ephemeral=True
+                "This only works inside a server, not in DMs.", ephemeral=True
             )
             return
         picker_view = DmRequestLookupView(

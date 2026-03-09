@@ -66,25 +66,25 @@ def precheck_dm_request(guild: Any, requester: Any, target: Any) -> tuple[str | 
     from ..config import DEBUG
 
     if target.id == requester.id and not DEBUG:
-        return "You cannot request permission with yourself.", None
+        return "You can't send a request to yourself!", None
     if target.bot:
-        return "You cannot request permission from bots.", None
+        return "Bots don't accept DM requests.", None
 
     mode = resolve_mode(target)
     if mode == "closed":
-        return f"{target.display_name} has DMs set to CLOSED and is not accepting requests.", None
+        return f"{target.display_name} isn't accepting DM requests right now.", None
     if mode == "open" and not DEBUG:
-        return f"{target.display_name} has DMs set to OPEN. No request required.", None
+        return f"{target.display_name} has their DMs open — no request needed, just message them!", None
     if is_mutual(guild.id, requester.id, target.id):
-        return "A permission relationship already exists.", None
+        return "You two already have a connection — no need to request again.", None
 
     request_channel_id = REQUEST_CHANNELS.get(guild.id)
     if not request_channel_id:
-        return "No DM request channel has been configured. Use `/dm_request_channel_set` first.", None
+        return "There's no DM request channel set up yet. An admin can fix that with `/dm_request_channel_set`.", None
 
     request_channel = guild.get_channel(request_channel_id)
     if not request_channel:
-        return "Configured DM request channel is invalid.", None
+        return "The configured request channel doesn't seem to exist anymore. An admin may need to update it.", None
 
     return None, request_channel
 

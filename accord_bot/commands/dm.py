@@ -78,16 +78,16 @@ async def _submit_dm_request(interaction, user, request_type, reason):
         return
 
     embed = discord.Embed(
-        title="📨 Permission Request",
+        title="📨 Someone wants to connect with you",
         description=(
             f"{user.mention}\n\n"
-            "You have a connection request.\n\n"
-            "This request will time out in 24 hours."
+            f"**{interaction.user.display_name}** would like to reach out to you.\n\n"
+            "This request expires in 24 hours."
         ),
         color=discord.Color.gold(),
     )
     embed.set_author(name=interaction.user.display_name, icon_url=interaction.user.display_avatar.url)
-    embed.set_footer(text="Permission can be revoked at any time with /dm_revoke")
+    embed.set_footer(text="You can revoke this permission at any time with /dm_revoke")
     embed.add_field(name="Request Type", value=request_type_label(req_type), inline=True)
     embed.add_field(name="Reason", value=reason_clean if reason_clean else "—", inline=False)
 
@@ -120,14 +120,14 @@ async def _submit_dm_request(interaction, user, request_type, reason):
 
     except discord.Forbidden:
         await interaction.response.send_message(
-            "I do not have permission to send messages in the configured DM request channel.",
+            "I don't have permission to post in the configured request channel.",
             ephemeral=True,
         )
         return
     except (discord.NotFound, discord.HTTPException) as exc:
         log.error("Failed to post DM request message: %s", exc)
         await interaction.response.send_message(
-            "Failed to send the DM request. The channel may be unavailable.", ephemeral=True
+            "Something went wrong sending the request — the channel might be unavailable.", ephemeral=True
         )
         return
 
@@ -136,7 +136,7 @@ async def _submit_dm_request(interaction, user, request_type, reason):
         f"DM request asked: {interaction.user.display_name} ➝ {user.display_name} ({request_type_label(req_type)})",
     )
     await interaction.response.send_message(
-        f"📨 DM request sent to {request_channel.mention}.",
+        f"📨 Request sent! They'll see it in {request_channel.mention}.",
         ephemeral=True,
     )
 
@@ -167,8 +167,8 @@ class AskConsentView(discord.ui.View):
             for child in self.children:
                 child.disabled = True
             timeout_embed = discord.Embed(
-                title="⌛ DM Request Expired",
-                description="This DM request expired after 24 hours.",
+                title="⌛ Request expired",
+                description="This one didn't get a response in time — it's been 24 hours.",
                 color=discord.Color.orange(),
             )
             timeout_embed.add_field(
@@ -188,7 +188,7 @@ class AskConsentView(discord.ui.View):
     async def accept(self, interaction: discord.Interaction, button: discord.ui.Button):
         if interaction.user.id != self.target_id:
             await interaction.response.send_message(
-                "You are not the target of this request.", ephemeral=True
+                "This request isn't for you.", ephemeral=True
             )
             return
 
@@ -197,7 +197,7 @@ class AskConsentView(discord.ui.View):
         target = guild.get_member(self.target_id)
 
         if not requester or not target:
-            await interaction.response.send_message("Could not resolve users.", ephemeral=True)
+            await interaction.response.send_message("Couldn't find one or both users in this server.", ephemeral=True)
             return
 
         INTERACTION_PAIRS.setdefault(self.guild_id, set())
@@ -230,15 +230,13 @@ class AskConsentView(discord.ui.View):
             child.disabled = True
 
         success_embed = discord.Embed(
-            title="✅ DM Permission Granted",
+            title="✅ Connection accepted!",
             color=discord.Color.green(),
         )
         success_embed.description = (
             f"**{requester.display_name}** <-> **{target.display_name}**\n"
-            f"Requester: {getattr(requester, 'mention', requester.display_name)}\n"
-            f"Target: {getattr(target, 'mention', target.display_name)}\n\n"
-            "Both users may now DM each other.\n"
-            "Permission can be revoked with `/dm_revoke`."
+            f"{getattr(requester, 'mention', requester.display_name)} and {getattr(target, 'mention', target.display_name)} can now DM each other.\n\n"
+            "Either of you can undo this at any time with `/dm_revoke`."
         )
         success_embed.add_field(
             name="Request Type", value=request_type_label(self.request_type), inline=True
@@ -255,7 +253,7 @@ class AskConsentView(discord.ui.View):
     async def deny(self, interaction: discord.Interaction, button: discord.ui.Button):
         if interaction.user.id != self.target_id:
             await interaction.response.send_message(
-                "You are not the target of this request.", ephemeral=True
+                "This request isn't for you.", ephemeral=True
             )
             return
 
@@ -263,8 +261,8 @@ class AskConsentView(discord.ui.View):
             child.disabled = True
 
         deny_embed = discord.Embed(
-            title="❌ DM Request Denied",
-            description="The request was declined.",
+            title="❌ Request declined",
+            description="No worries — the request was turned down.",
             color=discord.Color.red(),
         )
         deny_embed.add_field(
@@ -439,14 +437,14 @@ async def dm_set_mode(interaction: discord.Interaction, mode: app_commands.Choic
         role_ask = await get_or_create(ROLE_DM_ASK)
         role_closed = await get_or_create(ROLE_DM_CLOSED)
     except discord.Forbidden:
-        await interaction.response.send_message("I lack permission to create roles.", ephemeral=True)
+        await interaction.response.send_message("I don't have permission to create roles here.", ephemeral=True)
         return
 
     dm_roles = [r for r in member.roles if r.name in DM_ROLE_NAMES]
     try:
         await member.remove_roles(*dm_roles)
     except discord.Forbidden:
-        await interaction.response.send_message("I lack permission to manage roles.", ephemeral=True)
+        await interaction.response.send_message("I don't have permission to manage roles here.", ephemeral=True)
         return
 
     if mode.value == "open":
@@ -460,8 +458,8 @@ async def dm_set_mode(interaction: discord.Interaction, mode: app_commands.Choic
         status = "CLOSED"
 
     embed = discord.Embed(
-        title="DM Request Mode Updated",
-        description=f"You are now set to **{status}**.",
+        title="DM preference updated",
+        description=f"You're now set to **{status}**.",
         color=discord.Color.gold(),
     )
     await interaction.response.send_message(embed=embed, ephemeral=True)
@@ -483,7 +481,7 @@ async def dm_revoke(interaction: discord.Interaction, user: discord.Member):
     guild_id = interaction.guild.id
 
     if guild_id not in INTERACTION_PAIRS:
-        await interaction.response.send_message("No consent records exist.", ephemeral=True)
+        await interaction.response.send_message("There are no connections to remove.", ephemeral=True)
         return
 
     pair_set = INTERACTION_PAIRS[guild_id]
@@ -496,7 +494,7 @@ async def dm_revoke(interaction: discord.Interaction, user: discord.Member):
         removed = True
 
     if not removed:
-        await interaction.response.send_message("No mutual consent existed.", ephemeral=True)
+        await interaction.response.send_message(f"You don't have a connection with {user.display_name}.", ephemeral=True)
         return
 
     meta = get_relationship_meta(guild_id, interaction.user.id, user.id)
@@ -505,10 +503,10 @@ async def dm_revoke(interaction: discord.Interaction, user: discord.Member):
         legacy_record = CONSENT_MESSAGES.get(guild_id, {}).get(f"{user.id}:{interaction.user.id}")
 
     revoked_embed = discord.Embed(
-        title="🚫 DM Permission Revoked",
+        title="🚫 Connection removed",
         description=(
             f"**{interaction.user.display_name}** ↔ **{user.display_name}**\n\n"
-            "You may no longer DM each other."
+            "The DM connection between you two has been removed."
         ),
         color=discord.Color.red(),
     )
@@ -557,7 +555,7 @@ async def dm_revoke(interaction: discord.Interaction, user: discord.Member):
         user2_id=user.id,
         request_type=meta.get("type"),
     )
-    await interaction.response.send_message(f"DM consent revoked with {user.mention}.")
+    await interaction.response.send_message(f"Done — your connection with {user.mention} has been removed.")
 
 
 async def dm_status(interaction: discord.Interaction, user: discord.Member):
@@ -567,9 +565,9 @@ async def dm_status(interaction: discord.Interaction, user: discord.Member):
         (interaction.user.id, user.id) in allowed_pairs
         and (user.id, interaction.user.id) in allowed_pairs
     )
-    result = "✅ Mutual consent active." if mutual else "❌ No mutual consent."
+    result = "✅ You two are connected." if mutual else "❌ No connection yet."
     await interaction.response.send_message(
-        f"**DM permission Status**\n\nYou ↔ {user.display_name}\n\n{result}",
+        f"**DM status — you & {user.display_name}**\n\n{result}",
         ephemeral=True,
     )
 
@@ -588,20 +586,20 @@ async def dm_ask(
 async def dm_request_channel_set(interaction: discord.Interaction, channel: discord.TextChannel):
     if not interaction.user.guild_permissions.manage_channels:
         await interaction.response.send_message(
-            "You do not have permission to configure this.", ephemeral=True
+            "You need the Manage Channels permission to do that.", ephemeral=True
         )
         return
     REQUEST_CHANNELS[interaction.guild.id] = channel.id
     save_request_channels()
     await interaction.response.send_message(
-        f"✅ DM requests will now be sent to {channel.mention}."
+        f"✅ DM requests will now go to {channel.mention}."
     )
 
 
 async def dm_request_panel_set(interaction: discord.Interaction, channel: discord.TextChannel):
     if not interaction.user.guild_permissions.manage_channels:
         await interaction.response.send_message(
-            "You do not have permission to configure the DM request panel.", ephemeral=True
+            "You need the Manage Channels permission to do that.", ephemeral=True
         )
         return
 
@@ -616,12 +614,12 @@ async def dm_request_panel_set(interaction: discord.Interaction, channel: discor
     )
     if message_id is None:
         await interaction.response.send_message(
-            "I could not post the DM request panel there. Check channel permissions.", ephemeral=True
+            "I couldn't post the panel there — double check that I have permission to send messages in that channel.", ephemeral=True
         )
         return
 
     await interaction.response.send_message(
-        f"✅ DM request panel set in {channel.mention}.", ephemeral=True
+        f"✅ Panel is live in {channel.mention}.", ephemeral=True
     )
     await log_audit_event(
         interaction.guild,
@@ -634,7 +632,7 @@ async def dm_request_panel_set(interaction: discord.Interaction, channel: discor
 async def dm_request_panel_refresh(interaction: discord.Interaction):
     if not interaction.user.guild_permissions.manage_channels:
         await interaction.response.send_message(
-            "You do not have permission to refresh the DM request panel.", ephemeral=True
+            "You need the Manage Channels permission to do that.", ephemeral=True
         )
         return
 
@@ -642,7 +640,7 @@ async def dm_request_panel_refresh(interaction: discord.Interaction):
     panel_channel_id = settings.get("panel_channel_id")
     if panel_channel_id is None:
         await interaction.response.send_message(
-            "No DM request panel is configured. Use `/dm_request_panel_set` first.", ephemeral=True
+            "No panel is set up yet — use `/dm_request_panel_set` to get started.", ephemeral=True
         )
         return
 
@@ -652,24 +650,24 @@ async def dm_request_panel_refresh(interaction: discord.Interaction):
     )
     if message_id is None:
         await interaction.response.send_message(
-            "I could not refresh the DM request panel in the configured channel.", ephemeral=True
+            "Couldn't refresh the panel — I may not have permission to post in that channel.", ephemeral=True
         )
         return
 
-    await interaction.response.send_message("✅ DM request panel refreshed.", ephemeral=True)
+    await interaction.response.send_message("✅ Panel bumped to the bottom.", ephemeral=True)
 
 
 async def dm_set_audit_channel(interaction: discord.Interaction, channel: discord.TextChannel):
     if not interaction.user.guild_permissions.manage_guild:
         await interaction.response.send_message(
-            "You do not have permission to configure audit logging.", ephemeral=True
+            "You need the Manage Server permission to do that.", ephemeral=True
         )
         return
 
     _audit_svc.AUDIT_LOG_CHANNEL_ID = channel.id
     AUDIT_LOG_CHANNELS[interaction.guild.id] = channel.id
     save_audit_channels()
-    await interaction.response.send_message(f"📜 Audit logs will now be sent to {channel.mention}.")
+    await interaction.response.send_message(f"📜 Audit logs will now go to {channel.mention}.")
 
 
 async def dm_audit_user(
@@ -679,7 +677,7 @@ async def dm_audit_user(
 ):
     if not interaction.user.guild_permissions.manage_guild:
         await interaction.response.send_message(
-            "You do not have permission to view audit logs.", ephemeral=True
+            "You need the Manage Server permission to view audit logs.", ephemeral=True
         )
         return
 
@@ -693,7 +691,7 @@ async def dm_audit_user(
         ][-limit:]
 
     if not data:
-        await interaction.response.send_message("No audit log entries found.", ephemeral=True)
+        await interaction.response.send_message("No audit entries found for that user.", ephemeral=True)
         return
 
     lines = [f"**{entry['timestamp']}**\n{entry['message']}\n" for entry in reversed(data)]

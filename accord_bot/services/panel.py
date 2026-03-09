@@ -64,14 +64,14 @@ def save_panel_settings() -> None:
 
 def _build_dm_request_panel_embed() -> discord.Embed:
     embed = discord.Embed(
-        title="DM Request Panel",
+        title="Want to reach out to someone?",
         description=(
-            "Click the button below to open a DM request modal.\n"
-            "This uses the same options as `/dm_ask` (user, request type, reason)."
+            "Hit the button below to send a DM request.\n"
+            "You'll pick who you want to contact, what kind of request it is, and optionally leave a reason."
         ),
         color=discord.Color.blurple(),
     )
-    embed.set_footer(text="This panel is kept as the latest message in this channel.")
+    embed.set_footer(text="Same as /dm_ask — just a little easier to get to.")
     return embed
 
 
