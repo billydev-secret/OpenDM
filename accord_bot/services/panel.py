@@ -159,4 +159,8 @@ async def bump_dm_request_panel_if_needed(message: Any) -> None:
         return
 
     DM_REQUEST_PANEL_BUMP_GUARD[guild.id] = now
-    await ensure_dm_request_panel_message(guild, int(panel_channel_id), force_repost=True)
+    from ..commands.dm import _precheck_dm_request, _submit_dm_request
+    await ensure_dm_request_panel_message(
+        guild, int(panel_channel_id), force_repost=True,
+        precheck_fn=_precheck_dm_request, submit_fn=_submit_dm_request,
+    )
