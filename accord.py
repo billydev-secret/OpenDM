@@ -1,5 +1,8 @@
 """Entry point: wire up commands and run the bot."""
 
+from dotenv import load_dotenv
+load_dotenv()  # Must run before accord_bot.config is imported
+
 from accord_bot.bot import bot
 from accord_bot.commands import dm as _dm_cmds, debug as _debug_cmds
 

@@ -6,7 +6,6 @@ import logging
 
 import discord
 from discord import app_commands
-from dotenv import load_dotenv
 
 from .config import DEBUG, GUILD_ID
 from .constants import DM_ROLE_NAMES
@@ -32,7 +31,6 @@ from .services.panel import (
 )
 from .views.panel import DmRequestPanelView
 
-load_dotenv()
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("accord")
 
