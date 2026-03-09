@@ -83,7 +83,7 @@ class DmRequestLookupView(discord.ui.View):
         self.request_type = "dm"
         self._sync_type_buttons()
         await interaction.response.edit_message(
-            content=_build_picker_prompt(self.selected_user_id, self.request_type), view=self
+            content=_build_picker_prompt(self.selected_user_id), view=self
         )
 
     @discord.ui.button(label="Type: Friend", style=discord.ButtonStyle.secondary)
@@ -91,7 +91,7 @@ class DmRequestLookupView(discord.ui.View):
         self.request_type = "friend"
         self._sync_type_buttons()
         await interaction.response.edit_message(
-            content=_build_picker_prompt(self.selected_user_id, self.request_type), view=self
+            content=_build_picker_prompt(self.selected_user_id), view=self
         )
 
     @discord.ui.button(label="Continue", style=discord.ButtonStyle.primary)
