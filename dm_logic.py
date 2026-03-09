@@ -1,21 +1,11 @@
-ROLE_DM_OPEN = "DMs: Open"
-ROLE_DM_ASK = "DMs: Ask"
-ROLE_DM_CLOSED = "DMs: Closed"
+# Re-exports for backward compatibility. Import from accord_bot directly.
+from accord_bot.constants import DM_ROLE_NAMES, ROLE_DM_ASK, ROLE_DM_CLOSED, ROLE_DM_OPEN
+from accord_bot.services.dm_roles import resolve_mode
 
-DM_ROLE_NAMES = {
-    ROLE_DM_OPEN,
-    ROLE_DM_ASK,
-    ROLE_DM_CLOSED,
-}
-
-
-def resolve_mode(member) -> str:
-    role_names = {role.name for role in member.roles}
-
-    if ROLE_DM_CLOSED in role_names:
-        return "closed"
-
-    if ROLE_DM_ASK in role_names:
-        return "ask"
-
-    return "open"
+__all__ = [
+    "ROLE_DM_OPEN",
+    "ROLE_DM_ASK",
+    "ROLE_DM_CLOSED",
+    "DM_ROLE_NAMES",
+    "resolve_mode",
+]
