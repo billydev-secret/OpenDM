@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import datetime
 from typing import Any
 
@@ -11,6 +12,13 @@ from ..models.database import connect_db, ensure_database
 
 PANEL_SETTINGS: dict[int, dict[str, int | None]] = {}
 DM_REQUEST_PANEL_BUMP_GUARD: dict[int, datetime.datetime] = {}
+_PANEL_LOCKS: dict[int, asyncio.Lock] = {}
+
+
+def _get_panel_lock(guild_id: int) -> asyncio.Lock:
+    if guild_id not in _PANEL_LOCKS:
+        _PANEL_LOCKS[guild_id] = asyncio.Lock()
+    return _PANEL_LOCKS[guild_id]
 
 
 def _default_panel_settings() -> dict[str, int | None]:
@@ -76,6 +84,23 @@ def _build_dm_request_panel_embed() -> discord.Embed:
 
 
 async def ensure_dm_request_panel_message(
+    guild: Any,
+    panel_channel_id: int,
+    *,
+    force_repost: bool = False,
+    precheck_fn=None,
+    submit_fn=None,
+) -> int | None:
+    async with _get_panel_lock(guild.id):
+        return await _ensure_dm_request_panel_message_locked(
+            guild, panel_channel_id,
+            force_repost=force_repost,
+            precheck_fn=precheck_fn,
+            submit_fn=submit_fn,
+        )
+
+
+async def _ensure_dm_request_panel_message_locked(
     guild: Any,
     panel_channel_id: int,
     *,
