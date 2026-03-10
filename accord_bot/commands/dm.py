@@ -77,6 +77,8 @@ async def _submit_dm_request(interaction, user, request_type, reason):
         )
         return
 
+    await interaction.response.defer(ephemeral=True)
+
     embed = discord.Embed(
         title="📨 Someone wants to connect with you",
         description=(
@@ -118,14 +120,14 @@ async def _submit_dm_request(interaction, user, request_type, reason):
         save_dm_requests()
 
     except discord.Forbidden:
-        await interaction.response.send_message(
+        await interaction.followup.send(
             "I don't have permission to post in the configured request channel.",
             ephemeral=True,
         )
         return
     except (discord.NotFound, discord.HTTPException) as exc:
         log.error("Failed to post DM request message: %s", exc)
-        await interaction.response.send_message(
+        await interaction.followup.send(
             "Something went wrong sending the request — the channel might be unavailable.", ephemeral=True
         )
         return
@@ -134,7 +136,7 @@ async def _submit_dm_request(interaction, user, request_type, reason):
         interaction.guild,
         f"DM request asked: {interaction.user.display_name} ➝ {user.display_name} ({request_type_label(req_type)})",
     )
-    await interaction.response.send_message(
+    await interaction.followup.send(
         f"📨 Request sent! They'll see it in {request_channel.mention}.",
         ephemeral=True,
     )
@@ -244,9 +246,9 @@ class AskConsentView(discord.ui.View):
             name="Reason", value=self.reason if self.reason else "—", inline=False
         )
 
+        await interaction.response.edit_message(embed=success_embed, view=self)
         await safe_dm_user(requester, success_embed)
         await safe_dm_user(target, success_embed)
-        await interaction.response.edit_message(embed=success_embed, view=self)
 
     @discord.ui.button(label="Deny", style=discord.ButtonStyle.danger)
     async def deny(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -431,19 +433,21 @@ async def dm_set_mode(interaction: discord.Interaction, mode: app_commands.Choic
             )
         return role
 
+    await interaction.response.defer(ephemeral=True)
+
     try:
         role_open = await get_or_create(ROLE_DM_OPEN)
         role_ask = await get_or_create(ROLE_DM_ASK)
         role_closed = await get_or_create(ROLE_DM_CLOSED)
     except discord.Forbidden:
-        await interaction.response.send_message("I don't have permission to create roles here.", ephemeral=True)
+        await interaction.followup.send("I don't have permission to create roles here.", ephemeral=True)
         return
 
     dm_roles = [r for r in member.roles if r.name in DM_ROLE_NAMES]
     try:
         await member.remove_roles(*dm_roles)
     except discord.Forbidden:
-        await interaction.response.send_message("I don't have permission to manage roles here.", ephemeral=True)
+        await interaction.followup.send("I don't have permission to manage roles here.", ephemeral=True)
         return
 
     if mode.value == "open":
@@ -461,7 +465,7 @@ async def dm_set_mode(interaction: discord.Interaction, mode: app_commands.Choic
         description=f"You're now set to **{status}**.",
         color=discord.Color.gold(),
     )
-    await interaction.response.send_message(embed=embed, ephemeral=True)
+    await interaction.followup.send(embed=embed, ephemeral=True)
 
 
 async def dm_allow(interaction: discord.Interaction, user: discord.Member):
@@ -602,6 +606,8 @@ async def dm_request_panel_set(interaction: discord.Interaction, channel: discor
         )
         return
 
+    await interaction.response.defer(ephemeral=True)
+
     settings = get_panel_settings(interaction.guild.id)
     settings["panel_channel_id"] = channel.id
     PANEL_SETTINGS[interaction.guild.id] = settings
@@ -612,12 +618,12 @@ async def dm_request_panel_set(interaction: discord.Interaction, channel: discor
         precheck_fn=_precheck_dm_request, submit_fn=_submit_dm_request,
     )
     if message_id is None:
-        await interaction.response.send_message(
+        await interaction.followup.send(
             "I couldn't post the panel there — double check that I have permission to send messages in that channel.", ephemeral=True
         )
         return
 
-    await interaction.response.send_message(
+    await interaction.followup.send(
         f"✅ Panel is live in {channel.mention}.", ephemeral=True
     )
     await log_audit_event(
@@ -643,17 +649,19 @@ async def dm_request_panel_refresh(interaction: discord.Interaction):
         )
         return
 
+    await interaction.response.defer(ephemeral=True)
+
     message_id = await ensure_dm_request_panel_message(
         interaction.guild, int(panel_channel_id), force_repost=True,
         precheck_fn=_precheck_dm_request, submit_fn=_submit_dm_request,
     )
     if message_id is None:
-        await interaction.response.send_message(
+        await interaction.followup.send(
             "Couldn't refresh the panel — I may not have permission to post in that channel.", ephemeral=True
         )
         return
 
-    await interaction.response.send_message("✅ Panel bumped to the bottom.", ephemeral=True)
+    await interaction.followup.send("✅ Panel bumped to the bottom.", ephemeral=True)
 
 
 async def dm_set_audit_channel(interaction: discord.Interaction, channel: discord.TextChannel):
