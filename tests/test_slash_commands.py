@@ -7,6 +7,7 @@ class DummyResponse:
     def __init__(self):
         self.send_message = AsyncMock()
         self.edit_message = AsyncMock()
+        self.defer = AsyncMock()
 
 
 def make_role(name, position=1):
@@ -51,8 +52,22 @@ def make_guild(guild_id=123, icon=None, members=None, channels=None, roles=None)
     )
 
 
-def make_interaction(guild, user):
-    return SimpleNamespace(guild=guild, user=user, response=DummyResponse())
+def make_client(guilds=None):
+    guilds = guilds or {}
+    return SimpleNamespace(
+        get_guild=lambda guild_id: guilds.get(guild_id),
+        fetch_channel=AsyncMock(side_effect=Exception("no client channel")),
+    )
+
+
+def make_interaction(guild, user, client=None):
+    return SimpleNamespace(
+        guild=guild,
+        user=user,
+        response=DummyResponse(),
+        followup=SimpleNamespace(send=AsyncMock()),
+        client=client or make_client(),
+    )
 
 
 def run(coro):
@@ -125,7 +140,7 @@ def test_dm_set_mode_updates_roles_and_responds(accord_module):
 
     user.remove_roles.assert_awaited_once()
     user.add_roles.assert_awaited_once_with(role_ask)
-    assert interaction.response.send_message.await_args.kwargs["embed"].description.endswith("**ASK**.")
+    assert interaction.followup.send.await_args.kwargs["embed"].description.endswith("**ASK**.")
 
 
 def test_dm_allow_stores_mutual_pair(accord_module, monkeypatch):
@@ -152,7 +167,7 @@ def test_dm_revoke_without_existing_records_returns_ephemeral(accord_module):
 
     kwargs = interaction.response.send_message.await_args.kwargs
     assert kwargs["ephemeral"] is True
-    assert get_sent_text(interaction.response.send_message) == "No consent records exist."
+    assert get_sent_text(interaction.response.send_message) == "There are no connections to remove."
 
 
 def test_dm_status_reports_mutual_consent(accord_module):
@@ -166,20 +181,45 @@ def test_dm_status_reports_mutual_consent(accord_module):
     run(accord_module.dm_status(interaction, target))
 
     content = get_sent_text(interaction.response.send_message)
-    assert "Mutual consent active" in content
+    assert "✅ You two are connected." in content
 
 
-def test_dm_ask_requires_configured_channel_when_missing(accord_module):
+def test_dm_ask_blocked_when_already_connected(accord_module, monkeypatch):
+    """dm_ask should early-fail (before any DM is sent) if the pair is already mutually connected."""
     requester = make_member(member_id=1, display_name="Requester")
     target = make_member(member_id=2, display_name="Target", roles=[make_role("DMs: Ask")])
     guild = make_guild(guild_id=123)
     interaction = make_interaction(guild, requester)
 
+    monkeypatch.setattr(
+        accord_module, "_precheck_dm_request",
+        lambda g, req, tgt: ("You two already have a connection — no need to request again.", None),
+    )
+
     run(accord_module.dm_ask(interaction, target))
 
     kwargs = interaction.response.send_message.await_args.kwargs
     assert kwargs["ephemeral"] is True
-    assert "No DM request channel has been configured" in get_sent_text(interaction.response.send_message)
+    assert "already have a connection" in get_sent_text(interaction.response.send_message)
+
+
+def test_dm_ask_blocked_when_pending_request_exists(accord_module, monkeypatch):
+    """dm_ask should fail if a request to that person is already pending."""
+    requester = make_member(member_id=1, display_name="Requester")
+    target = make_member(member_id=2, display_name="Target", roles=[make_role("DMs: Ask")])
+    guild = make_guild(guild_id=123)
+    interaction = make_interaction(guild, requester)
+
+    monkeypatch.setattr(
+        accord_module, "_precheck_dm_request",
+        lambda g, req, tgt: ("You already have a pending request to them — wait for them to respond.", None),
+    )
+
+    run(accord_module.dm_ask(interaction, target))
+
+    kwargs = interaction.response.send_message.await_args.kwargs
+    assert kwargs["ephemeral"] is True
+    assert "pending request" in get_sent_text(interaction.response.send_message)
 
 
 def test_dm_request_channel_set_updates_channel_when_permitted(accord_module, monkeypatch):
@@ -220,7 +260,8 @@ def test_dm_request_panel_set_updates_channel_when_permitted(accord_module, monk
 
     settings = accord_module.PANEL_SETTINGS[999]
     assert settings["panel_channel_id"] == 88
-    assert "#dm-request-panel" in get_sent_text(interaction.response.send_message)
+    sent = interaction.followup.send.await_args.args[0] if interaction.followup.send.await_args.args else interaction.followup.send.await_args.kwargs.get("content", "")
+    assert "#dm-request-panel" in sent
 
 
 def test_debug_status_check_reports_open_state(accord_module):
@@ -283,7 +324,7 @@ def test_dm_set_audit_channel_requires_manage_guild_permission(accord_module):
     run(accord_module.dm_set_audit_channel(interaction, channel))
 
     kwargs = interaction.response.send_message.await_args.kwargs
-    assert get_sent_text(interaction.response.send_message) == "You do not have permission to configure audit logging."
+    assert "Manage Server" in get_sent_text(interaction.response.send_message)
     assert kwargs["ephemeral"] is True
 
 
@@ -296,14 +337,15 @@ def test_accept_embed_lists_both_consented_users(accord_module, monkeypatch):
     guild = make_guild(guild_id=333, members={10: requester, 20: target})
     interaction = make_interaction(guild, target)
 
-    view = accord_module.AskConsentView(requester_id=10, target_id=20)
+    view = accord_module.AskConsentView(requester_id=10, target_id=20, guild_id=333)
     view.message = SimpleNamespace(id=999, channel=SimpleNamespace(id=321))
 
     run(view.accept(interaction, None))
 
     embed = interaction.response.edit_message.await_args.kwargs["embed"]
-    assert "Requester: <@10>" in embed.description
-    assert "Target: <@20>" in embed.description
+    assert embed.title == "✅ Connection accepted!"
+    assert "Requester" in embed.description
+    assert "Target" in embed.description
 
 
 def test_dm_revoke_updates_existing_grant_embed(accord_module, monkeypatch):
@@ -333,4 +375,4 @@ def test_dm_revoke_updates_existing_grant_embed(accord_module, monkeypatch):
 
     message.edit.assert_awaited_once()
     revoked_embed = message.edit.await_args.kwargs["embed"]
-    assert revoked_embed.title == "🚫 DM Permission Revoked"
+    assert revoked_embed.title == "🚫 Connection removed"

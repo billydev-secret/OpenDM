@@ -16,3 +16,14 @@ async def safe_dm_user(user: Any, embed: discord.Embed) -> None:
         await sender(embed=embed)
     except (discord.Forbidden, discord.HTTPException):
         pass
+
+
+async def send_dm(user: Any, **kwargs) -> discord.Message | None:
+    """Send a DM and return the Message object, or None on failure."""
+    sender = getattr(user, "send", None)
+    if sender is None:
+        return None
+    try:
+        return await sender(**kwargs)
+    except (discord.Forbidden, discord.HTTPException):
+        return None
