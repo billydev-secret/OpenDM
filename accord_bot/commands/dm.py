@@ -45,7 +45,7 @@ from ..services.panel import (
     get_panel_settings,
     save_panel_settings,
 )
-from ..utils import safe_dm_user, send_dm
+from ..utils import safe_dm_user
 
 
 # ---------------------------------------------------------------------------
@@ -66,15 +66,20 @@ async def _submit_dm_request(interaction, user, request_type, reason):
     if len(reason_clean) > 256:
         reason_clean = reason_clean[:253] + "..."
 
-    error_message, _ = _precheck_dm_request(guild, requester, user)
+    error_message, request_channel = _precheck_dm_request(guild, requester, user)
     if error_message:
         await interaction.response.send_message(error_message, ephemeral=True)
         return
 
+    if request_channel is None:
+        await interaction.response.send_message(
+            "Configured DM request channel is invalid.", ephemeral=True
+        )
+        return
+
     await interaction.response.defer(ephemeral=True)
 
-    # Embed shown to the target (has Accept / Deny buttons)
-    target_embed = discord.Embed(
+    embed = discord.Embed(
         title="📨 Someone wants to connect with you",
         description=(
             f"{user.mention}\n\n"
@@ -82,26 +87,10 @@ async def _submit_dm_request(interaction, user, request_type, reason):
         ),
         color=discord.Color.gold(),
     )
-    target_embed.set_author(name=requester.display_name, icon_url=requester.display_avatar.url)
-    target_embed.set_footer(text="You can revoke this permission at any time with /dm_revoke")
-    target_embed.add_field(name="Request Type", value=request_type_label(req_type), inline=True)
-    target_embed.add_field(name="Reason", value=reason_clean if reason_clean else "—", inline=False)
-    target_embed.add_field(name="Status", value="⏳ Pending", inline=False)
-
-    # Embed shown to the requester (status only, no buttons)
-    requester_embed = discord.Embed(
-        title="📨 DM request sent",
-        description=(
-            f"Your request to connect with {user.mention} has been sent.\n\n"
-            "This request expires in 24 hours."
-        ),
-        color=discord.Color.gold(),
-    )
-    requester_embed.set_author(name=user.display_name, icon_url=user.display_avatar.url)
-    requester_embed.set_footer(text="You'll be notified here when they respond.")
-    requester_embed.add_field(name="Request Type", value=request_type_label(req_type), inline=True)
-    requester_embed.add_field(name="Reason", value=reason_clean if reason_clean else "—", inline=False)
-    requester_embed.add_field(name="Status", value="⏳ Pending", inline=False)
+    embed.set_author(name=interaction.user.display_name, icon_url=interaction.user.display_avatar.url)
+    embed.set_footer(text="You can revoke this permission at any time with /dm_revoke")
+    embed.add_field(name="Request Type", value=request_type_label(req_type), inline=True)
+    embed.add_field(name="Reason", value=reason_clean if reason_clean else "—", inline=False)
 
     view = AskConsentView(
         requester_id=requester.id,
@@ -111,33 +100,44 @@ async def _submit_dm_request(interaction, user, request_type, reason):
         reason=reason_clean,
     )
 
-    target_msg = await send_dm(user, embed=target_embed, view=view)
-    if target_msg is None:
+    try:
+        message = await request_channel.send(
+            content=user.mention,
+            embed=embed,
+            view=view,
+            allowed_mentions=discord.AllowedMentions(users=[user]),
+        )
+        await message.edit(content=None)
+        view.message = message
+
+        DM_REQUESTS.setdefault(guild_id, {})
+        DM_REQUESTS[guild_id][(requester.id, user.id)] = {
+            "message_id": message.id,
+            "request_type": req_type,
+            "reason": reason_clean,
+            "created_at": datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC"),
+        }
+        save_dm_requests()
+
+    except discord.Forbidden:
         await interaction.followup.send(
-            f"Couldn't reach {user.display_name} via DM — they may have DMs from server members disabled.",
+            "I don't have permission to post in the configured request channel.",
             ephemeral=True,
         )
         return
-
-    requester_msg = await send_dm(requester, embed=requester_embed)
-    view.message = target_msg
-    view.requester_message = requester_msg
-
-    DM_REQUESTS.setdefault(guild_id, {})
-    DM_REQUESTS[guild_id][(requester.id, user.id)] = {
-        "message_id": target_msg.id,
-        "request_type": req_type,
-        "reason": reason_clean,
-        "created_at": datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC"),
-    }
-    save_dm_requests()
+    except (discord.NotFound, discord.HTTPException) as exc:
+        log.error("Failed to post DM request message: %s", exc)
+        await interaction.followup.send(
+            "Something went wrong sending the request — the channel might be unavailable.", ephemeral=True
+        )
+        return
 
     await log_audit_event(
         interaction.guild,
-        f"DM request asked: {requester.display_name} ➝ {user.display_name} ({request_type_label(req_type)})",
+        f"DM request asked: {interaction.user.display_name} ➝ {user.display_name} ({request_type_label(req_type)})",
     )
     await interaction.followup.send(
-        "📨 Request sent! They'll receive it in their DMs.",
+        f"📨 Request sent! They'll see it in {request_channel.mention}.",
         ephemeral=True,
     )
 
@@ -154,8 +154,7 @@ class AskConsentView(discord.ui.View):
         self.guild_id = guild_id
         self.request_type = normalize_request_type(request_type)
         self.reason = (reason or "").strip()
-        self.message = None          # target's DM message (has the buttons)
-        self.requester_message = None  # requester's DM message (status only)
+        self.message = None
 
     def _clear_request_record(self):
         recs = DM_REQUESTS.get(self.guild_id, {})
@@ -165,47 +164,26 @@ class AskConsentView(discord.ui.View):
             del DM_REQUESTS[self.guild_id]
 
     async def on_timeout(self):
-        for child in self.children:
-            child.disabled = True
-        timeout_embed = discord.Embed(
-            title="⌛ Request expired",
-            description="This one didn't get a response in time — it's been 24 hours.",
-            color=discord.Color.orange(),
-        )
-        timeout_embed.add_field(
-            name="Request Type", value=request_type_label(self.request_type), inline=True
-        )
-        timeout_embed.add_field(
-            name="Reason", value=self.reason if self.reason else "—", inline=False
-        )
         if self.message:
+            for child in self.children:
+                child.disabled = True
+            timeout_embed = discord.Embed(
+                title="⌛ Request expired",
+                description="This one didn't get a response in time — it's been 24 hours.",
+                color=discord.Color.orange(),
+            )
+            timeout_embed.add_field(
+                name="Request Type", value=request_type_label(self.request_type), inline=True
+            )
+            timeout_embed.add_field(
+                name="Reason", value=self.reason if self.reason else "—", inline=False
+            )
             try:
                 await self.message.edit(embed=timeout_embed, view=self)
             except (discord.NotFound, discord.Forbidden, discord.HTTPException) as exc:
-                log.warning("Could not update expired target DM message: %s", exc)
-        if self.requester_message:
-            try:
-                await self.requester_message.edit(embed=timeout_embed)
-            except (discord.NotFound, discord.Forbidden, discord.HTTPException) as exc:
-                log.warning("Could not update expired requester DM message: %s", exc)
-        self._clear_request_record()
-        save_dm_requests()
-
-        from ..bot import bot
-        guild = bot.get_guild(self.guild_id)
-        if guild:
-            requester = guild.get_member(self.requester_id)
-            target = guild.get_member(self.target_id)
-            req_name = requester.display_name if requester else str(self.requester_id)
-            tgt_name = target.display_name if target else str(self.target_id)
-            await log_audit_event(
-                guild,
-                f"DM request expired: {req_name} ➝ {tgt_name} ({request_type_label(self.request_type)})",
-                action="request_expired",
-                user1_id=self.requester_id,
-                user2_id=self.target_id,
-                request_type=self.request_type,
-            )
+                log.warning("Could not update expired request message: %s", exc)
+            self._clear_request_record()
+            save_dm_requests()
 
     @discord.ui.button(label="Accept", style=discord.ButtonStyle.success)
     async def accept(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -215,14 +193,7 @@ class AskConsentView(discord.ui.View):
             )
             return
 
-        # Works from DM interactions (interaction.guild is None) and guild interactions alike
-        guild = interaction.guild or interaction.client.get_guild(self.guild_id)
-        if not guild:
-            await interaction.response.send_message(
-                "Couldn't find the server — it may have been deleted.", ephemeral=True
-            )
-            return
-
+        guild = interaction.guild
         requester = guild.get_member(self.requester_id)
         target = guild.get_member(self.target_id)
 
@@ -276,21 +247,8 @@ class AskConsentView(discord.ui.View):
         )
 
         await interaction.response.edit_message(embed=success_embed, view=self)
-        if self.requester_message:
-            try:
-                await self.requester_message.edit(embed=success_embed)
-            except (discord.NotFound, discord.Forbidden, discord.HTTPException) as exc:
-                log.warning("Could not update requester DM on accept: %s", exc)
-
-        await log_audit_event(
-            guild,
-            f"DM request accepted: {requester.display_name} ➝ {target.display_name} ({request_type_label(self.request_type)})",
-            action="request_accepted",
-            actor_id=self.target_id,
-            user1_id=self.requester_id,
-            user2_id=self.target_id,
-            request_type=self.request_type,
-        )
+        await safe_dm_user(requester, success_embed)
+        await safe_dm_user(target, success_embed)
 
     @discord.ui.button(label="Deny", style=discord.ButtonStyle.danger)
     async def deny(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -315,29 +273,8 @@ class AskConsentView(discord.ui.View):
             name="Reason", value=self.reason if self.reason else "—", inline=False
         )
         await interaction.response.edit_message(embed=deny_embed, view=self)
-        if self.requester_message:
-            try:
-                await self.requester_message.edit(embed=deny_embed)
-            except (discord.NotFound, discord.Forbidden, discord.HTTPException) as exc:
-                log.warning("Could not update requester DM on deny: %s", exc)
         self._clear_request_record()
         save_dm_requests()
-
-        guild = interaction.guild or interaction.client.get_guild(self.guild_id)
-        if guild:
-            requester = guild.get_member(self.requester_id)
-            target = guild.get_member(self.target_id)
-            req_name = requester.display_name if requester else str(self.requester_id)
-            tgt_name = target.display_name if target else str(self.target_id)
-            await log_audit_event(
-                guild,
-                f"DM request denied: {req_name} ➝ {tgt_name} ({request_type_label(self.request_type)})",
-                action="request_denied",
-                actor_id=self.target_id,
-                user1_id=self.requester_id,
-                user2_id=self.target_id,
-                request_type=self.request_type,
-            )
 
 
 # ---------------------------------------------------------------------------
@@ -597,12 +534,6 @@ async def dm_revoke(interaction: discord.Interaction, user: discord.Member):
 
     if request_channel_id:
         channel = interaction.guild.get_channel(request_channel_id)
-        if channel is None:
-            # The stored channel may be a DM channel — fetch it directly from the client
-            try:
-                channel = await interaction.client.fetch_channel(request_channel_id)
-            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
-                channel = None
         if channel:
             message_id = meta.get("source_message_id")
             if not message_id and legacy_record:
