@@ -61,8 +61,8 @@ def resolve_member_from_text(guild: Any, raw: str) -> Any:
     return None
 
 
-def precheck_dm_request(guild: Any, requester: Any, target: Any) -> tuple[str | None, Any]:
-    """Validate a DM request. Returns (error_message, request_channel)."""
+def precheck_dm_request(guild: Any, requester: Any, target: Any) -> tuple[str | None, None]:
+    """Validate a DM request. Returns (error_message, None)."""
     from ..config import DEBUG
 
     if target.id == requester.id and not DEBUG:
@@ -78,15 +78,11 @@ def precheck_dm_request(guild: Any, requester: Any, target: Any) -> tuple[str | 
     if is_mutual(guild.id, requester.id, target.id):
         return "You two already have a connection — no need to request again.", None
 
-    request_channel_id = REQUEST_CHANNELS.get(guild.id)
-    if not request_channel_id:
-        return "There's no DM request channel set up yet. An admin can fix that with `/dm_request_channel_set`.", None
+    pending = DM_REQUESTS.get(guild.id, {})
+    if (requester.id, target.id) in pending:
+        return "You already have a pending request to them — wait for them to respond.", None
 
-    request_channel = guild.get_channel(request_channel_id)
-    if not request_channel:
-        return "The configured request channel doesn't seem to exist anymore. An admin may need to update it.", None
-
-    return None, request_channel
+    return None, None
 
 
 # ---------------------------------------------------------------------------

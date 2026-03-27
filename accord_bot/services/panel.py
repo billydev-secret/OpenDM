@@ -72,14 +72,48 @@ def save_panel_settings() -> None:
 
 def _build_dm_request_panel_embed() -> discord.Embed:
     embed = discord.Embed(
-        title="Want to reach out to someone?",
+        title="📬 DM Request System",
         description=(
-            "Hit the button below to send a DM request.\n"
-            "You'll pick who you want to contact, what kind of request it is, and optionally leave a reason."
+            "Want to reach out to someone privately? Use the button below to send them a request first.\n\n"
+            "Requests are delivered straight to their DMs — nothing gets posted publicly here."
         ),
         color=discord.Color.blurple(),
     )
-    embed.set_footer(text="Same as /dm_ask — just a little easier to get to.")
+    embed.add_field(
+        name="👤 DM Status Roles",
+        value=(
+            "Every member has a status that controls who can reach them. "
+            "You can see someone's preference right on their profile as a role:\n\n"
+            "🟢 **DMs: Open** — Anyone can message them freely\n"
+            "🟡 **DMs: Ask** — They want to approve requests first\n"
+            "🔴 **DMs: Closed** — Not accepting requests right now\n\n"
+            "Set your own preference with `/dm_set_mode`."
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="📋 How to Send a Request",
+        value=(
+            "1. Hit **Open DM Request Form** below\n"
+            "2. Pick the person you want to reach\n"
+            "3. Choose the request type\n"
+            "4. Optionally write a short reason\n"
+            "5. Submit — they'll get a DM from this bot with Accept / Deny buttons\n\n"
+            "You'll be notified in your own DMs when they respond."
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="💬 DM vs Friend Request — what's the difference?",
+        value=(
+            "**Direct Message** — You just want to chat with them on this server. "
+            "This does *not* send a Discord friend request; it only grants permission within this community.\n\n"
+            "**Friend Request** — You'd like to add them as a Discord friend, which lets you DM them "
+            "outside of this server too. Choose this if you want a longer-term connection beyond just here."
+        ),
+        inline=False,
+    )
+    embed.set_footer(text="You can revoke any connection at any time with /dm_revoke.")
     return embed
 
 
