@@ -185,6 +185,22 @@ class AskConsentView(discord.ui.View):
             self._clear_request_record()
             save_dm_requests()
 
+            guild = self.message.guild
+            if guild:
+                requester = guild.get_member(self.requester_id)
+                target = guild.get_member(self.target_id)
+                requester_name = requester.display_name if requester else str(self.requester_id)
+                target_name = target.display_name if target else str(self.target_id)
+                await log_audit_event(
+                    guild,
+                    f"DM request expired: {requester_name} ➝ {target_name} ({request_type_label(self.request_type)})",
+                    action="request_expired",
+                    actor_id=None,
+                    user1_id=self.requester_id,
+                    user2_id=self.target_id,
+                    request_type=self.request_type,
+                )
+
     @discord.ui.button(label="Accept", style=discord.ButtonStyle.success)
     async def accept(self, interaction: discord.Interaction, button: discord.ui.Button):
         if interaction.user.id != self.target_id:
@@ -250,6 +266,16 @@ class AskConsentView(discord.ui.View):
         await safe_dm_user(requester, success_embed)
         await safe_dm_user(target, success_embed)
 
+        await log_audit_event(
+            guild,
+            f"DM request accepted: {requester.display_name} ↔ {target.display_name} ({request_type_label(self.request_type)})",
+            action="request_accepted",
+            actor_id=self.target_id,
+            user1_id=self.requester_id,
+            user2_id=self.target_id,
+            request_type=self.request_type,
+        )
+
     @discord.ui.button(label="Deny", style=discord.ButtonStyle.danger)
     async def deny(self, interaction: discord.Interaction, button: discord.ui.Button):
         if interaction.user.id != self.target_id:
@@ -275,6 +301,21 @@ class AskConsentView(discord.ui.View):
         await interaction.response.edit_message(embed=deny_embed, view=self)
         self._clear_request_record()
         save_dm_requests()
+
+        guild = interaction.guild
+        requester = guild.get_member(self.requester_id)
+        target = guild.get_member(self.target_id)
+        requester_name = requester.display_name if requester else str(self.requester_id)
+        target_name = target.display_name if target else str(self.target_id)
+        await log_audit_event(
+            guild,
+            f"DM request denied: {requester_name} ➝ {target_name} ({request_type_label(self.request_type)})",
+            action="request_denied",
+            actor_id=self.target_id,
+            user1_id=self.requester_id,
+            user2_id=self.target_id,
+            request_type=self.request_type,
+        )
 
 
 # ---------------------------------------------------------------------------
