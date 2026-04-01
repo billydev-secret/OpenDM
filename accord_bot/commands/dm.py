@@ -66,11 +66,13 @@ async def _submit_dm_request(interaction, user, request_type, reason):
     if len(reason_clean) > 256:
         reason_clean = reason_clean[:253] + "..."
 
-    error_message, request_channel = _precheck_dm_request(guild, requester, user)
+    error_message, _ = _precheck_dm_request(guild, requester, user)
     if error_message:
         await interaction.response.send_message(error_message, ephemeral=True)
         return
 
+    channel_id = REQUEST_CHANNELS.get(guild_id)
+    request_channel = guild.get_channel(channel_id) if channel_id else None
     if request_channel is None:
         await interaction.response.send_message(
             "Configured DM request channel is invalid.", ephemeral=True
