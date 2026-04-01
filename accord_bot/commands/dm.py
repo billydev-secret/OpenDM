@@ -113,6 +113,19 @@ async def _submit_dm_request(interaction, user, request_type, reason):
     }
     save_dm_requests()
 
+    sender_embed = discord.Embed(
+        title="📨 Request sent!",
+        description=(
+            f"Your {request_type_label(req_type).lower()} request to **{user.display_name}** "
+            f"in **{guild.name}** has been delivered.\n\n"
+            "You'll get a DM when they respond. The request expires in 24 hours."
+        ),
+        color=discord.Color.gold(),
+    )
+    sender_embed.add_field(name="Request Type", value=request_type_label(req_type), inline=True)
+    sender_embed.add_field(name="Reason", value=reason_clean if reason_clean else "—", inline=False)
+    await safe_dm_user(requester, sender_embed)
+
     await log_audit_event(
         interaction.guild,
         f"DM request asked: {interaction.user.display_name} ➝ {user.display_name} ({request_type_label(req_type)})",
@@ -173,6 +186,25 @@ class AskConsentView(discord.ui.View):
                 target = guild.get_member(self.target_id)
                 requester_name = requester.display_name if requester else str(self.requester_id)
                 target_name = target.display_name if target else str(self.target_id)
+
+                if requester:
+                    expired_requester_embed = discord.Embed(
+                        title="⌛ Request expired",
+                        description=(
+                            f"Your {request_type_label(self.request_type).lower()} request "
+                            f"to **{target_name}** in **{guild.name}** expired after 24 hours "
+                            "without a response."
+                        ),
+                        color=discord.Color.orange(),
+                    )
+                    expired_requester_embed.add_field(
+                        name="Request Type", value=request_type_label(self.request_type), inline=True
+                    )
+                    expired_requester_embed.add_field(
+                        name="Reason", value=self.reason if self.reason else "—", inline=False
+                    )
+                    await safe_dm_user(requester, expired_requester_embed)
+
                 await log_audit_event(
                     guild,
                     f"DM request expired: {requester_name} ➝ {target_name} ({request_type_label(self.request_type)})",
@@ -293,6 +325,24 @@ class AskConsentView(discord.ui.View):
             target = guild.get_member(self.target_id)
             requester_name = requester.display_name if requester else str(self.requester_id)
             target_name = target.display_name if target else str(self.target_id)
+
+            if requester:
+                requester_embed = discord.Embed(
+                    title="❌ Request declined",
+                    description=(
+                        f"Your {request_type_label(self.request_type).lower()} request "
+                        f"to **{target_name}** in **{guild.name}** was declined."
+                    ),
+                    color=discord.Color.red(),
+                )
+                requester_embed.add_field(
+                    name="Request Type", value=request_type_label(self.request_type), inline=True
+                )
+                requester_embed.add_field(
+                    name="Reason", value=self.reason if self.reason else "—", inline=False
+                )
+                await safe_dm_user(requester, requester_embed)
+
             await log_audit_event(
                 guild,
                 f"DM request denied: {requester_name} ➝ {target_name} ({request_type_label(self.request_type)})",
