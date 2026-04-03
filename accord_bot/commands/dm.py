@@ -280,6 +280,7 @@ class AskConsentView(discord.ui.View):
         )
 
         await interaction.response.edit_message(embed=success_embed, view=self)
+        self.stop()
         await safe_dm_user(requester, success_embed)
         await safe_dm_user(target, success_embed)
 
@@ -316,6 +317,7 @@ class AskConsentView(discord.ui.View):
             name="Reason", value=self.reason if self.reason else "—", inline=False
         )
         await interaction.response.edit_message(embed=deny_embed, view=self)
+        self.stop()
         self._clear_request_record()
         save_dm_requests()
 
