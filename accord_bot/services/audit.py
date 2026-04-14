@@ -13,17 +13,15 @@ from .permissions import normalize_request_type
 
 log = logging.getLogger(__name__)
 
-AUDIT_LOG_CHANNEL_ID: int | None = None
 AUDIT_LOG_CHANNELS: dict[int, int] = {}
 
 
 def load_audit_channels() -> None:
-    global AUDIT_LOG_CHANNELS, AUDIT_LOG_CHANNEL_ID
+    global AUDIT_LOG_CHANNELS
     ensure_database()
     with connect_db() as conn:
         rows = conn.execute("SELECT guild_id, channel_id FROM audit_channels").fetchall()
     AUDIT_LOG_CHANNELS = {int(r["guild_id"]): int(r["channel_id"]) for r in rows}
-    AUDIT_LOG_CHANNEL_ID = next(iter(AUDIT_LOG_CHANNELS.values()), None)
 
 
 def save_audit_channels() -> None:
@@ -96,7 +94,7 @@ async def log_audit_event(
         "message": message, "actor_id": actor_id, "user1_id": user1_id, "user2_id": user2_id,
     })
 
-    channel_id = AUDIT_LOG_CHANNELS.get(guild.id) or AUDIT_LOG_CHANNEL_ID
+    channel_id = AUDIT_LOG_CHANNELS.get(guild.id)
     if channel_id:
         channel = guild.get_channel(channel_id)
         if channel:

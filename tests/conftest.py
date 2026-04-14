@@ -285,6 +285,5 @@ def accord_module():
     _dm.DM_REQUESTS = {}
     _dm.REQUEST_CHANNELS = {}
     _dm.PANEL_SETTINGS = {}
-    _dm.AUDIT_LOG_CHANNEL_ID = None
 
     return _dm

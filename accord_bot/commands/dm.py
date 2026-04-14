@@ -37,7 +37,6 @@ from ..services.audit import (
     log_audit_event,
     save_audit_channels,
 )
-import accord_bot.services.audit as _audit_svc
 
 from ..services.panel import (
     PANEL_SETTINGS,
@@ -750,7 +749,6 @@ async def dm_set_audit_channel(interaction: discord.Interaction, channel: discor
         )
         return
 
-    _audit_svc.AUDIT_LOG_CHANNEL_ID = channel.id
     AUDIT_LOG_CHANNELS[interaction.guild.id] = channel.id
     save_audit_channels()
     await interaction.response.send_message(f"📜 Audit logs will now go to {channel.mention}.")
@@ -794,6 +792,24 @@ async def dm_audit_user(
 
 
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# /invite
+# ---------------------------------------------------------------------------
+
+async def invite(interaction: discord.Interaction):
+    permissions = discord.Permissions(
+        manage_roles=True,
+        send_messages=True,
+        embed_links=True,
+        read_message_history=True,
+        use_application_commands=True,
+    )
+    url = discord.utils.oauth_url(interaction.client.user.id, permissions=permissions)
+    await interaction.response.send_message(
+        f"[Click here to invite me to your server]({url})", ephemeral=True
+    )
+
+
 # Command registration
 # ---------------------------------------------------------------------------
 
@@ -851,3 +867,5 @@ def setup(bot) -> None:
     tree.command(name="dm_audit_user", description="Show DM permission audit history for a user")(
         app_commands.describe(user="User to inspect", limit="Number of recent entries to show (default 10)")(dm_audit_user)
     )
+
+    tree.command(name="invite", description="Get a link to invite this bot to your server")(invite)

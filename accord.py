@@ -40,6 +40,7 @@ from accord_bot.commands.dm import (  # noqa: E402, F401
     dm_request_panel_refresh,
     dm_set_audit_channel,
     dm_audit_user,
+    invite,
 )
 from accord_bot.commands.debug import (  # noqa: F401
     debug_status_check,
@@ -47,10 +48,6 @@ from accord_bot.commands.debug import (  # noqa: F401
     debug_permissions_set,
     debug_permissions_remove,
 )
-import accord_bot.services.audit as _audit_svc
-
-AUDIT_LOG_CHANNEL_ID = _audit_svc.AUDIT_LOG_CHANNEL_ID
-
 if __name__ == "__main__":
     from accord_bot.config import TOKEN
     if not TOKEN:
