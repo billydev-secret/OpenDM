@@ -7,6 +7,13 @@ from typing import Any
 import discord
 
 
+def safe_field_text(text: str | None) -> str:
+    """Escape markdown in user-supplied embed field text; return em-dash for empty."""
+    if not text:
+        return "—"
+    return discord.utils.escape_markdown(text)
+
+
 async def safe_dm_user(user: Any, embed: discord.Embed) -> None:
     """Send a DM embed, silently ignoring Forbidden/HTTP errors."""
     sender = getattr(user, "send", None)

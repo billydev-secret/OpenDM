@@ -104,6 +104,9 @@ def _install_fake_discord():
             self.children.append(item)
             setattr(item, "view", self)
 
+        def stop(self):
+            pass
+
     class UserSelect:
         def __init__(self, placeholder=None, min_values=1, max_values=1):
             self.placeholder = placeholder
@@ -168,7 +171,7 @@ def _install_fake_discord():
     discord_mod.Color = Color
     discord_mod.Client = Client
     discord_mod.TextStyle = TextStyle
-    discord_mod.utils = SimpleNamespace(get=utils_get)
+    discord_mod.utils = SimpleNamespace(get=utils_get, escape_markdown=lambda text: text)
     discord_mod.ui = SimpleNamespace(
         View=View,
         Modal=Modal,

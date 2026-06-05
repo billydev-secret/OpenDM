@@ -4,7 +4,8 @@
       "Bash(.venv/Scripts/python:*)",
       "Bash(python:*)",
       "Bash(pip install:*)",
-      "Bash(python3:*)"
+      "Bash(python3:*)",
+      "Bash(grep -E \"\\\\.\\(yml|yaml|sh|txt\\)$\")"
     ]
   }
 }

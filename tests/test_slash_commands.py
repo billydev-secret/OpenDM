@@ -265,7 +265,7 @@ def test_dm_request_panel_set_updates_channel_when_permitted(accord_module, monk
 
 
 def test_debug_status_check_reports_open_state(accord_module):
-    user = make_member(member_id=8)
+    user = make_member(member_id=8, roles=[SimpleNamespace(name="DMs: Open")])
     guild = make_guild(guild_id=101, members={8: user})
     interaction = make_interaction(guild, user)
 
@@ -331,13 +331,27 @@ def test_dm_set_audit_channel_requires_manage_guild_permission(accord_module):
 def test_accept_embed_lists_both_consented_users(accord_module, monkeypatch):
     monkeypatch.setattr(accord_module, "save_consent", lambda: None)
     monkeypatch.setattr(accord_module, "save_consent_messages", lambda: None)
+    monkeypatch.setattr(accord_module, "save_relationships", lambda: None)
+    monkeypatch.setattr(accord_module, "save_dm_requests", lambda: None)
 
     requester = make_member(member_id=10, display_name="Requester")
     target = make_member(member_id=20, display_name="Target")
     guild = make_guild(guild_id=333, members={10: requester, 20: target})
-    interaction = make_interaction(guild, target)
+    client = make_client(guilds={333: guild})
+    interaction = make_interaction(guild, target, client=client)
+    interaction.message = SimpleNamespace(id=999, channel=SimpleNamespace(id=321))
 
-    view = accord_module.AskConsentView(requester_id=10, target_id=20, guild_id=333)
+    # Persistent view looks up request by message_id from DM_REQUESTS
+    accord_module.DM_REQUESTS[333] = {
+        (10, 20): {
+            "message_id": 999,
+            "request_type": "dm",
+            "reason": "",
+            "created_at": "2024-01-01 00:00:00 UTC",
+        }
+    }
+
+    view = accord_module.AskConsentView()
     view.message = SimpleNamespace(id=999, channel=SimpleNamespace(id=321))
 
     run(view.accept(interaction, None))

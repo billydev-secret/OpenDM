@@ -18,6 +18,6 @@ def test_resolve_mode_returns_ask_when_ask_role_present():
     assert resolve_mode(member) == "ask"
 
 
-def test_resolve_mode_defaults_to_open_without_matching_role():
+def test_resolve_mode_defaults_to_ask_without_matching_role():
     member = _member_with_roles("Moderator")
-    assert resolve_mode(member) == "open"
+    assert resolve_mode(member) == "ask"

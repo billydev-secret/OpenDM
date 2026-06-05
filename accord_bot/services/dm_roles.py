@@ -1,6 +1,6 @@
 """DM role resolution logic."""
 
-from ..constants import ROLE_DM_ASK, ROLE_DM_CLOSED
+from ..constants import ROLE_DM_ASK, ROLE_DM_CLOSED, ROLE_DM_OPEN
 
 
 def resolve_mode(member) -> str:
@@ -10,7 +10,7 @@ def resolve_mode(member) -> str:
     if ROLE_DM_CLOSED in role_names:
         return "closed"
 
-    if ROLE_DM_ASK in role_names:
-        return "ask"
+    if ROLE_DM_OPEN in role_names:
+        return "open"
 
-    return "open"
+    return "ask"
